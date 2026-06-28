@@ -23,7 +23,7 @@ export interface ResearchControllerOptions {
   store: MarkdownStore;
   providers: ProviderRegistry;
   roleRunner?: RoleRunner;
-  limits?: Partial<typeof DEFAULT_LIMITS>;
+  limits?: Partial<Record<keyof typeof DEFAULT_LIMITS, number>>;
 }
 
 export type ResearchEventListener = (event: ResearchEvent) => void;
@@ -276,7 +276,7 @@ export class ResearchController {
   private readonly listeners = new Set<ResearchEventListener>();
   private readonly activeRuns = new Map<string, RunState>();
   private readonly roleRunner: RoleRunner;
-  private readonly limits: typeof DEFAULT_LIMITS;
+  private readonly limits: Record<keyof typeof DEFAULT_LIMITS, number>;
 
   constructor(private readonly options: ResearchControllerOptions) {
     this.roleRunner = options.roleRunner ?? createHybridRoleRunner();
