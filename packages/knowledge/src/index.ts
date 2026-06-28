@@ -11,7 +11,7 @@ import type {
   ResearchRun,
 } from "@fdr/schemas";
 
-const RUN_SUBDIRS = ["sources", "claims", "questions", "critiques", "insights", "audits", "feedback"] as const;
+const RUN_SUBDIRS = ["sources", "claims", "questions", "critiques", "insights", "audits", "memory", "feedback"] as const;
 
 export interface MarkdownStoreOptions {
   dataDir: string;
@@ -368,6 +368,52 @@ export class MarkdownStore {
       `- Rating: ${input.feedback.rating}`,
       `- Dimension: ${input.feedback.dimension}`,
       input.feedback.note ? `- Note: ${input.feedback.note}` : undefined,
+      "",
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    await appendFile(filePath, section);
+  }
+
+  async appendRecurringLesson(input: {
+    runId: string;
+    title: string;
+    domain?: string;
+    lesson: string;
+    evidence: string[];
+    tags: string[];
+  }): Promise<void> {
+    await this.ensureBase();
+    const filePath = path.join(this.globalDir, "recurring_lessons.md");
+    if (!(await exists(filePath))) {
+      await writeFile(
+        filePath,
+        [
+          "---",
+          "type: recurring_lessons",
+          `updated_at: ${nowIso()}`,
+          "---",
+          "",
+          "# Recurring Lessons",
+          "",
+          "Reusable research lessons are appended here after runs complete.",
+          "",
+        ].join("\n"),
+      );
+    }
+    const section = [
+      "",
+      `## ${input.title}`,
+      "",
+      `- Run: ${input.runId}`,
+      input.domain ? `- Domain: ${input.domain}` : undefined,
+      `- Tags: ${input.tags.join(", ")}`,
+      "",
+      input.lesson,
+      "",
+      "### Evidence",
+      "",
+      ...input.evidence.map((item) => `- ${item}`),
       "",
     ]
       .filter((line): line is string => line !== undefined)

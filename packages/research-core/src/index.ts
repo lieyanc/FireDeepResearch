@@ -70,6 +70,14 @@ function compactText(value: string, maxLength: number): string {
   return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength - 1)}...`;
 }
 
+function sourceHost(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url.split("/")[0] || "unknown";
+  }
+}
+
 function stripMarkdown(value: string): string {
   return value
     .replace(/^---[\s\S]*?---/m, "")
@@ -391,6 +399,11 @@ export class ResearchController {
     await this.writeQualityAudit(run, sourceResults, claims, "initial");
     await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "initial", insights });
     const report = await this.writeReport(run, input, sourceResults, claims, insights, memory, signal);
+    await this.writeMemoryUpdate(run, sourceResults, claims, {
+      phase: "initial",
+      domain: input.domain,
+      report,
+    });
     run = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "run.finished", runId: run.id, reportPath: report.path, at: nowIso() });
   }
@@ -484,6 +497,12 @@ export class ResearchController {
     await this.writeQualityAudit(run, sourceResults, claims, "continuation");
     await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "continuation" });
     const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, signal);
+    await this.writeMemoryUpdate(run, sourceResults, claims, {
+      phase: "continuation",
+      domain: input.domain,
+      focus: cleanFocus,
+      report,
+    });
     const finished = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "continuation.finished", runId: finished.id, reportPath: report.path, at: nowIso() });
   }
@@ -1049,6 +1068,106 @@ export class ResearchController {
     });
     await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
     await this.options.store.appendBlackboard(run.id, "Evidence Ledger", `Wrote ${ledgerId} with ${claims.length} traced claims.`);
+    return artifact;
+  }
+
+  private async writeMemoryUpdate(
+    run: ResearchRun,
+    sources: ReadSourceResult[],
+    claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
+    options: { phase: "initial" | "continuation"; domain?: string; focus?: string; report: ArtifactRef },
+  ): Promise<ArtifactRef> {
+    const sourceRecords = sources.map(({ source }) => source);
+    const sourceKinds = [...new Set(sourceRecords.map((source) => source.sourceKind))];
+    const hosts = [...new Set(sourceRecords.map((source) => sourceHost(source.url)))];
+    const highCredibility = sourceRecords.filter((source) => source.credibility >= 0.75);
+    const challenged = claims.filter(({ claim }) => claim.status !== "verified");
+    const reputationAdjusted = sourceRecords.filter((source) => (source.reputationAdjustment ?? 0) !== 0);
+    const dominantSourceKind = Object.entries(
+      sourceRecords.reduce<Record<string, number>>((counts, source) => {
+        counts[source.sourceKind] = (counts[source.sourceKind] ?? 0) + 1;
+        return counts;
+      }, {}),
+    ).sort((a, b) => b[1] - a[1])[0]?.[0];
+    const lessonTitle = `Research lesson ${new Date().toISOString().slice(0, 10)} (${options.phase})`;
+    const lesson = [
+      sourceKinds.length < 3
+        ? "This run had limited source-kind diversity; future runs on similar questions should allocate more searches to independent primary or practitioner evidence."
+        : "This run benefited from a mixed source set; preserving source-kind diversity should remain part of the default search plan.",
+      challenged.length > 0
+        ? "Challenged claims should be carried forward as follow-up search targets rather than hidden in the final narrative."
+        : "Verified claims were comparatively strong, but future runs should still inspect source independence before raising confidence.",
+      reputationAdjusted.length > 0
+        ? "User source reputation feedback affected scoring; future runs should surface these adjustments in source review."
+        : "No source reputation feedback affected this run; future user ratings can improve source priors.",
+    ].join(" ");
+    const evidence = [
+      `${sourceRecords.length} sources across ${sourceKinds.length} source kinds and ${hosts.length} hosts.`,
+      `${highCredibility.length} high-credibility sources; ${challenged.length} challenged claims.`,
+      dominantSourceKind ? `Dominant source kind: ${dominantSourceKind}.` : "No dominant source kind detected.",
+      `Report artifact: ${options.report.id}.`,
+    ];
+    const tags = [
+      "run-memory",
+      options.phase,
+      ...(options.domain ? [options.domain] : []),
+      ...sourceKinds.slice(0, 4),
+    ];
+    const existing = await this.options.store.listArtifacts(run.id);
+    const memoryIndex = existing.filter((artifact) => artifact.kind === "memory").length + 1;
+    const memoryId = `memory-update-${String(memoryIndex).padStart(3, "0")}`;
+    const body = [
+      "# Memory Update",
+      "",
+      `Phase: ${options.phase}`,
+      options.focus ? `Focus: ${options.focus}` : undefined,
+      "",
+      "## Reusable Lesson",
+      "",
+      lesson,
+      "",
+      "## Evidence",
+      "",
+      ...evidence.map((item) => `- ${item}`),
+      "",
+      "## Next Run Hints",
+      "",
+      sourceKinds.length < 3 ? "- Increase source-kind diversity before final synthesis." : "- Preserve the current source-kind diversity pattern.",
+      challenged.length > 0 ? "- Seed follow-up searches from challenged claim ids and question artifacts." : "- Continue auditing verified claims for source independence.",
+      "- Keep source reputation adjustments visible in source review.",
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    const artifact = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "memory",
+      id: memoryId,
+      title: `Memory Update (${options.phase})`,
+      collection: "memory",
+      frontmatter: {
+        id: memoryId,
+        type: "memory",
+        memory_kind: "run_lesson",
+        phase: options.phase,
+        domain: options.domain,
+        report: options.report.id,
+        source_count: sourceRecords.length,
+        claim_count: claims.length,
+        challenged_claim_count: challenged.length,
+        tags,
+      },
+      body,
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
+    await this.options.store.appendRecurringLesson({
+      runId: run.id,
+      title: lessonTitle,
+      domain: options.domain,
+      lesson,
+      evidence,
+      tags,
+    });
+    await this.options.store.appendBlackboard(run.id, "Memory Update", `Wrote ${memoryId} and updated global recurring lessons.`);
     return artifact;
   }
 

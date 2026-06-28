@@ -23,7 +23,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 
-type ArtifactTab = "report" | "ledger" | "claim" | "source" | "question" | "insight" | "audit";
+type ArtifactTab = "report" | "ledger" | "claim" | "source" | "question" | "insight" | "audit" | "memory";
 
 interface HealthState {
   ok: boolean;
@@ -43,6 +43,7 @@ const tabLabels: Record<ArtifactTab, string> = {
   question: "Questions",
   insight: "Insights",
   audit: "Audit",
+  memory: "Memory",
 };
 
 const tabKinds: Record<ArtifactTab, ArtifactKind[]> = {
@@ -53,6 +54,7 @@ const tabKinds: Record<ArtifactTab, ArtifactKind[]> = {
   question: ["question", "critique"],
   insight: ["insight"],
   audit: ["audit"],
+  memory: ["memory", "feedback"],
 };
 
 function cn(...values: Array<string | false | undefined>): string {
