@@ -389,6 +389,7 @@ export class ResearchController {
     const insights = await this.mineInsights(run, input, sourceResults, claims, memory, signal);
     await this.auditClaims(run, claims, sourceResults, signal);
     await this.writeQualityAudit(run, sourceResults, claims, "initial");
+    await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "initial", insights });
     const report = await this.writeReport(run, input, sourceResults, claims, insights, memory, signal);
     run = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "run.finished", runId: run.id, reportPath: report.path, at: nowIso() });
@@ -481,6 +482,7 @@ export class ResearchController {
     await this.challengeClaims(run, claims, signal, { startIndex: questionStartIndex });
     await this.auditClaims(run, claims, sourceResults, signal, { startIndex: auditStartIndex });
     await this.writeQualityAudit(run, sourceResults, claims, "continuation");
+    await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "continuation" });
     const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, signal);
     const finished = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "continuation.finished", runId: finished.id, reportPath: report.path, at: nowIso() });
@@ -925,6 +927,129 @@ export class ResearchController {
       },
     );
     await this.options.store.appendBlackboard(run.id, "Audit", `Audited ${claims.length} claims for citation support.`);
+  }
+
+  private async writeEvidenceLedger(
+    run: ResearchRun,
+    sources: ReadSourceResult[],
+    claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
+    options: { phase: "initial" | "continuation"; insights?: ArtifactRef[] },
+  ): Promise<ArtifactRef> {
+    const sourceRecords = sources.map(({ source }) => source);
+    const sourceById = new Map(sourceRecords.map((source) => [source.id, source]));
+    const allArtifacts = await this.options.store.listArtifacts(run.id);
+    const relevantArtifacts = allArtifacts.filter((artifact) =>
+      ["question", "critique", "audit", "insight"].includes(artifact.kind),
+    );
+    const docs = (
+      await Promise.all(relevantArtifacts.map((artifact) => this.options.store.readArtifact(run.id, artifact.path)))
+    ).filter((doc): doc is NonNullable<typeof doc> => Boolean(doc));
+
+    const refsForClaim = (claimId: string, kind: "question" | "critique" | "audit") =>
+      docs.filter((doc) => doc.kind === kind && doc.frontmatter.target === claimId);
+
+    const sourceRows = sourceRecords
+      .map(
+        (source) =>
+          `| ${source.id} | ${source.sourceKind} | ${source.credibility} | ${
+            source.reputationAdjustment ?? 0
+          } | ${source.title.replaceAll("|", "\\|")} |`,
+      )
+      .join("\n");
+
+    const claimRows = claims
+      .map(({ claim }) => {
+        const questions = refsForClaim(claim.id, "question").map((doc) => doc.id);
+        const audits = refsForClaim(claim.id, "audit").map((doc) => doc.id);
+        const sourceCells = claim.sources
+          .map((sourceId) => {
+            const source = sourceById.get(sourceId);
+            return source ? `${sourceId} (${source.credibility})` : sourceId;
+          })
+          .join(", ");
+        return `| ${claim.id} | ${claim.claimKind} | ${claim.status} | ${claim.confidence} | ${sourceCells} | ${
+          questions.join(", ") || "none"
+        } | ${audits.join(", ") || "none"} |`;
+      })
+      .join("\n");
+
+    const quoteSections = sourceRecords
+      .map((source) => [
+        `### ${source.id}: ${source.title}`,
+        "",
+        `Credibility: ${source.credibility}; kind: ${source.sourceKind}; reputation adjustment: ${source.reputationAdjustment ?? 0}`,
+        "",
+        ...source.keyQuotes.map((quote) => `> ${quote}`),
+      ].join("\n"))
+      .join("\n\n");
+
+    const openChallenges = docs
+      .filter((doc) => doc.kind === "question" || doc.kind === "critique")
+      .filter((doc) => claims.some(({ claim }) => doc.frontmatter.target === claim.id || doc.frontmatter.question_id === claim.id))
+      .map((doc) => `- ${doc.id}: ${doc.title}`)
+      .join("\n");
+
+    const insightRefs = options.insights?.length
+      ? options.insights.map((insight) => `- ${insight.id}: ${insight.title}`).join("\n")
+      : docs
+          .filter((doc) => doc.kind === "insight")
+          .map((doc) => `- ${doc.id}: ${doc.title}`)
+          .join("\n");
+
+    const existingLedgers = allArtifacts.filter((artifact) => artifact.kind === "ledger");
+    const ledgerIndex = existingLedgers.length + 1;
+    const ledgerId = `evidence-ledger-${String(ledgerIndex).padStart(3, "0")}`;
+    const filename = ledgerIndex === 1 ? "evidence_ledger.md" : `${ledgerId}.md`;
+    const body = [
+      "# Evidence Ledger",
+      "",
+      `Phase: ${options.phase}`,
+      "",
+      "## Claim Trace Matrix",
+      "",
+      "| Claim | Kind | Status | Confidence | Supporting Sources | Challenges | Audits |",
+      "| --- | --- | --- | ---: | --- | --- | --- |",
+      claimRows || "| none | none | none | 0 | none | none | none |",
+      "",
+      "## Source Ledger",
+      "",
+      "| Source | Kind | Credibility | Reputation Adj. | Title |",
+      "| --- | --- | ---: | ---: | --- |",
+      sourceRows || "| none | none | 0 | 0 | none |",
+      "",
+      "## Evidence Quotes",
+      "",
+      quoteSections || "No quotes extracted.",
+      "",
+      "## Open Challenges",
+      "",
+      openChallenges || "No open challenge linked to the claims in this phase.",
+      "",
+      "## Insight Links",
+      "",
+      insightRefs || "No insight linked.",
+    ].join("\n");
+
+    const artifact = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "ledger",
+      id: ledgerId,
+      title: `Evidence Ledger (${options.phase})`,
+      filename,
+      frontmatter: {
+        id: ledgerId,
+        type: "ledger",
+        phase: options.phase,
+        claim_count: claims.length,
+        source_count: sourceRecords.length,
+        insight_count: options.insights?.length ?? docs.filter((doc) => doc.kind === "insight").length,
+        tags: ["evidence-ledger", options.phase],
+      },
+      body,
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
+    await this.options.store.appendBlackboard(run.id, "Evidence Ledger", `Wrote ${ledgerId} with ${claims.length} traced claims.`);
+    return artifact;
   }
 
   private async writeQualityAudit(

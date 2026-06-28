@@ -583,6 +583,50 @@ button {
   word-break: break-word;
 }
 
+.linked-artifacts {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 254, 250, 0.72);
+}
+
+.linked-title {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 650;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+.linked-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.linked-list button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  max-width: 100%;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--foreground);
+  cursor: pointer;
+}
+
+.linked-list span {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.linked-list small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
 .feedback-buttons {
   display: inline-flex;
   gap: 6px;

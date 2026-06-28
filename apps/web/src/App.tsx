@@ -23,7 +23,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 
-type ArtifactTab = "report" | "claim" | "source" | "question" | "insight" | "audit";
+type ArtifactTab = "report" | "ledger" | "claim" | "source" | "question" | "insight" | "audit";
 
 interface HealthState {
   ok: boolean;
@@ -37,6 +37,7 @@ const SAMPLE_QUERY =
 
 const tabLabels: Record<ArtifactTab, string> = {
   report: "Report",
+  ledger: "Ledger",
   claim: "Claims",
   source: "Sources",
   question: "Questions",
@@ -46,6 +47,7 @@ const tabLabels: Record<ArtifactTab, string> = {
 
 const tabKinds: Record<ArtifactTab, ArtifactKind[]> = {
   report: ["report"],
+  ledger: ["ledger"],
   claim: ["claim"],
   source: ["source"],
   question: ["question", "critique"],
@@ -55,6 +57,24 @@ const tabKinds: Record<ArtifactTab, ArtifactKind[]> = {
 
 function cn(...values: Array<string | false | undefined>): string {
   return values.filter(Boolean).join(" ");
+}
+
+function asStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string");
+  }
+  return typeof value === "string" && value ? [value] : [];
+}
+
+function frontmatterRefs(frontmatter: Record<string, unknown>): string[] {
+  return [
+    ...asStringArray(frontmatter.sources),
+    ...asStringArray(frontmatter.source),
+    ...asStringArray(frontmatter.target),
+    ...asStringArray(frontmatter.question_id),
+    ...asStringArray(frontmatter.artifact_id),
+    ...asStringArray(frontmatter.opposes),
+  ];
 }
 
 function formatTime(value?: string): string {
@@ -182,6 +202,7 @@ export function App() {
   const [selectedRunId, setSelectedRunId] = useState<string>();
   const [events, setEvents] = useState<ResearchEvent[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
+  const [artifactDocsByPath, setArtifactDocsByPath] = useState<Record<string, ArtifactDocument>>({});
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactDocument>();
   const [activeTab, setActiveTab] = useState<ArtifactTab>("report");
   const [health, setHealth] = useState<HealthState>();
@@ -203,6 +224,20 @@ export function App() {
     return artifacts.filter((artifact) => kinds.includes(artifact.kind));
   }, [activeTab, artifacts]);
 
+  const linkedArtifacts = useMemo(() => {
+    if (!selectedArtifact) {
+      return [];
+    }
+    const directIds = new Set(frontmatterRefs(selectedArtifact.frontmatter));
+    const reverseIds = new Set(
+      Object.values(artifactDocsByPath)
+        .filter((doc) => doc.id !== selectedArtifact.id && frontmatterRefs(doc.frontmatter).includes(selectedArtifact.id))
+        .map((doc) => doc.id),
+    );
+    const ids = new Set([...directIds, ...reverseIds]);
+    return artifacts.filter((artifact) => ids.has(artifact.id));
+  }, [artifactDocsByPath, artifacts, selectedArtifact]);
+
   const latestReport = useMemo(() => {
     return artifacts.find((artifact) => artifact.kind === "report") ?? artifacts.find((artifact) => artifact.path === "final_report.md");
   }, [artifacts]);
@@ -218,6 +253,19 @@ export function App() {
   const refreshArtifacts = useCallback(async (runId: string) => {
     const payload = await api.listArtifacts(runId);
     setArtifacts(payload.artifacts);
+    const docs = await Promise.all(
+      payload.artifacts.map(async (artifact) => {
+        try {
+          const response = await api.readArtifact(runId, artifact.path);
+          return [artifact.path, response.artifact] as const;
+        } catch {
+          return [artifact.path, undefined] as const;
+        }
+      }),
+    );
+    setArtifactDocsByPath(
+      Object.fromEntries(docs.filter((entry): entry is readonly [string, ArtifactDocument] => Boolean(entry[1]))),
+    );
   }, []);
 
   const openArtifact = useCallback(
@@ -227,6 +275,7 @@ export function App() {
       }
       const payload = await api.readArtifact(selectedRunId, artifact.path);
       setSelectedArtifact(payload.artifact);
+      setArtifactDocsByPath((current) => ({ ...current, [artifact.path]: payload.artifact }));
     },
     [selectedRunId],
   );
@@ -566,6 +615,20 @@ export function App() {
                   </div>
                 ))}
               </div>
+              {linkedArtifacts.length > 0 ? (
+                <div className="linked-artifacts">
+                  <div className="linked-title">Related artifacts</div>
+                  <div className="linked-list">
+                    {linkedArtifacts.map((artifact) => (
+                      <button key={artifact.path} onClick={() => openArtifact(artifact)}>
+                        <FileText size={13} />
+                        <span>{artifact.id}</span>
+                        <small>{artifact.kind}</small>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               <MarkdownView body={selectedArtifact.body} />
             </>
           ) : (
