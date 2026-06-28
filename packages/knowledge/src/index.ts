@@ -58,6 +58,22 @@ function extractTitle(body: string, fallback: string): string {
   return heading?.[1]?.trim() || fallback;
 }
 
+function cleanFrontmatter(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entryValue]) => entryValue !== undefined)
+      .map(([key, entryValue]) => {
+        if (Array.isArray(entryValue)) {
+          return [key, entryValue.filter((item) => item !== undefined)];
+        }
+        if (entryValue && typeof entryValue === "object") {
+          return [key, cleanFrontmatter(entryValue as Record<string, unknown>)];
+        }
+        return [key, entryValue];
+      }),
+  );
+}
+
 async function exists(filePath: string): Promise<boolean> {
   try {
     await stat(filePath);
@@ -207,14 +223,14 @@ export class MarkdownStore {
     const timestamp = nowIso();
     const filePath = this.artifactPath(input);
     await mkdir(path.dirname(filePath), { recursive: true });
-    const frontmatter = {
+    const frontmatter = cleanFrontmatter({
       id: input.id,
       type: input.kind,
       title: input.title,
       created_at: timestamp,
       updated_at: timestamp,
       ...(input.frontmatter ?? {}),
-    };
+    });
     const content = matter.stringify(input.body.trimEnd() + "\n", frontmatter);
     const frontmatterRecord = frontmatter as Record<string, unknown>;
     await writeFile(filePath, content);
@@ -321,5 +337,5 @@ export class MarkdownStore {
 }
 
 export function getDefaultDataDir(): string {
-  return process.env.FDR_DATA_DIR ?? path.resolve(process.cwd(), "knowledge");
+  return process.env.FDR_DATA_DIR ?? path.resolve(process.env.INIT_CWD ?? process.cwd(), "knowledge");
 }
