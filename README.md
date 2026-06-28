@@ -42,6 +42,7 @@ The mock provider mode runs without API keys and still exercises the full pipeli
 - Human feedback artifacts that update global Markdown source reputation memory and influence later source credibility scoring.
 - Run-level quality audit summaries with source mix, average credibility, claim status, risk flags, and recommended next actions.
 - Evidence Ledger artifacts that connect claims, sources, challenges, audits, quotes, and insights in a trace matrix.
+- Cross-check contradiction matrices that mark claim independence, corroboration gaps, and opposing signals.
 - Memory Update artifacts and global recurring lessons that capture reusable research experience after each run.
 - SSE event streaming for live run updates.
 - shadcn-style research cockpit with run list, live room timeline, artifact tabs, evidence detail panel, related-artifact navigation, and feedback controls.

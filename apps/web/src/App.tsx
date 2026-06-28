@@ -23,7 +23,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 
-type ArtifactTab = "report" | "ledger" | "claim" | "source" | "question" | "insight" | "audit" | "memory";
+type ArtifactTab = "report" | "ledger" | "check" | "claim" | "source" | "question" | "insight" | "audit" | "memory";
 
 interface HealthState {
   ok: boolean;
@@ -38,6 +38,7 @@ const SAMPLE_QUERY =
 const tabLabels: Record<ArtifactTab, string> = {
   report: "Report",
   ledger: "Ledger",
+  check: "Cross-check",
   claim: "Claims",
   source: "Sources",
   question: "Questions",
@@ -49,6 +50,7 @@ const tabLabels: Record<ArtifactTab, string> = {
 const tabKinds: Record<ArtifactTab, ArtifactKind[]> = {
   report: ["report"],
   ledger: ["ledger"],
+  check: ["contradiction"],
   claim: ["claim"],
   source: ["source"],
   question: ["question", "critique"],

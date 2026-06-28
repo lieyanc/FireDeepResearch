@@ -11,7 +11,17 @@ import type {
   ResearchRun,
 } from "@fdr/schemas";
 
-const RUN_SUBDIRS = ["sources", "claims", "questions", "critiques", "insights", "audits", "memory", "feedback"] as const;
+const RUN_SUBDIRS = [
+  "sources",
+  "claims",
+  "questions",
+  "critiques",
+  "contradictions",
+  "insights",
+  "audits",
+  "memory",
+  "feedback",
+] as const;
 
 export interface MarkdownStoreOptions {
   dataDir: string;

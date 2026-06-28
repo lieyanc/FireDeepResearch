@@ -396,6 +396,7 @@ export class ResearchController {
     await this.challengeClaims(run, claims, signal);
     const insights = await this.mineInsights(run, input, sourceResults, claims, memory, signal);
     await this.auditClaims(run, claims, sourceResults, signal);
+    await this.writeContradictionMatrix(run, sourceResults, claims, "initial");
     await this.writeQualityAudit(run, sourceResults, claims, "initial");
     await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "initial", insights });
     const report = await this.writeReport(run, input, sourceResults, claims, insights, memory, signal);
@@ -494,6 +495,7 @@ export class ResearchController {
     const claims = await this.extractClaims(run, sourceResults, signal, { startIndex: claimStartIndex });
     await this.challengeClaims(run, claims, signal, { startIndex: questionStartIndex });
     await this.auditClaims(run, claims, sourceResults, signal, { startIndex: auditStartIndex });
+    await this.writeContradictionMatrix(run, sourceResults, claims, "continuation");
     await this.writeQualityAudit(run, sourceResults, claims, "continuation");
     await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "continuation" });
     const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, signal);
@@ -958,7 +960,7 @@ export class ResearchController {
     const sourceById = new Map(sourceRecords.map((source) => [source.id, source]));
     const allArtifacts = await this.options.store.listArtifacts(run.id);
     const relevantArtifacts = allArtifacts.filter((artifact) =>
-      ["question", "critique", "audit", "insight"].includes(artifact.kind),
+      ["question", "critique", "contradiction", "audit", "insight"].includes(artifact.kind),
     );
     const docs = (
       await Promise.all(relevantArtifacts.map((artifact) => this.options.store.readArtifact(run.id, artifact.path)))
@@ -1068,6 +1070,140 @@ export class ResearchController {
     });
     await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
     await this.options.store.appendBlackboard(run.id, "Evidence Ledger", `Wrote ${ledgerId} with ${claims.length} traced claims.`);
+    return artifact;
+  }
+
+  private findOpposingSignals(claim: ClaimRecord, sources: SourceRecord[]): string[] {
+    const claimText = claim.text.toLowerCase();
+    const sourceText = (source: SourceRecord) => `${source.title} ${source.summary} ${source.keyQuotes.join(" ")}`.toLowerCase();
+    const signals: string[] = [];
+
+    for (const source of sources.filter((candidate) => !claim.sources.includes(candidate.id))) {
+      const text = sourceText(source);
+      if (/governance|audit|permission|compliance|security|data-control|data control/.test(claimText)) {
+        if (/individual|bottom-up|speed|editor fit|shadow adoption|helpfulness/.test(text)) {
+          signals.push(`${source.id}: bottom-up speed/adoption signal may qualify governance-first framing`);
+        }
+      } else if (/individual|bottom-up|speed|editor|developer/.test(claimText)) {
+        if (/procurement|governance|audit|permission|compliance|data retention/.test(text)) {
+          signals.push(`${source.id}: procurement/governance gate may limit bottom-up adoption`);
+        }
+      } else if (/workflow|context|integration|differentiation|benchmark/.test(claimText)) {
+        if (/model benchmark|model quality|raw model|autocomplete/.test(text)) {
+          signals.push(`${source.id}: model-capability framing may compete with workflow differentiation`);
+        }
+      } else if (/review|stale|long-horizon|mistake|risk/.test(claimText)) {
+        if (/accelerate|speedup|routine edits|test generation/.test(text)) {
+          signals.push(`${source.id}: productivity evidence may soften risk-heavy framing`);
+        }
+      }
+    }
+
+    return [...new Set(signals)].slice(0, 3);
+  }
+
+  private async writeContradictionMatrix(
+    run: ResearchRun,
+    sources: ReadSourceResult[],
+    claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
+    phase: "initial" | "continuation",
+  ): Promise<ArtifactRef> {
+    const sourceRecords = sources.map(({ source }) => source);
+    const sourceById = new Map(sourceRecords.map((source) => [source.id, source]));
+    const rows = claims.map(({ claim }) => {
+      const supportingSources = claim.sources.map((sourceId) => sourceById.get(sourceId)).filter((source): source is SourceRecord => Boolean(source));
+      const sourceKinds = [...new Set(supportingSources.map((source) => source.sourceKind))];
+      const hosts = [...new Set(supportingSources.map((source) => sourceHost(source.url)))];
+      const opposingSignals = this.findOpposingSignals(claim, sourceRecords);
+      const independence =
+        supportingSources.length >= 2 && (hosts.length >= 2 || sourceKinds.length >= 2)
+          ? "independent"
+          : supportingSources.length >= 2
+            ? "partially_independent"
+            : "single_source";
+      const verdict =
+        opposingSignals.length > 0
+          ? "mixed"
+          : independence === "single_source"
+            ? "needs_corroboration"
+            : claim.status === "verified"
+              ? "supported"
+              : "qualified";
+      return {
+        claim,
+        supportingSources,
+        sourceKinds,
+        hosts,
+        opposingSignals,
+        independence,
+        verdict,
+      };
+    });
+
+    const matrixRows = rows
+      .map(
+        (row) =>
+          `| ${row.claim.id} | ${row.verdict} | ${row.independence} | ${row.supportingSources
+            .map((source) => source.id)
+            .join(", ")} | ${row.sourceKinds.join(", ") || "none"} | ${row.hosts.length} | ${
+            row.opposingSignals.join("<br>") || "none"
+          } |`,
+      )
+      .join("\n");
+    const mixedCount = rows.filter((row) => row.verdict === "mixed").length;
+    const needsCorroborationCount = rows.filter((row) => row.verdict === "needs_corroboration").length;
+    const existing = await this.options.store.listArtifacts(run.id);
+    const matrixIndex = existing.filter((artifact) => artifact.kind === "contradiction").length + 1;
+    const matrixId = `contradiction-matrix-${String(matrixIndex).padStart(3, "0")}`;
+    const body = [
+      "# Cross-check & Contradiction Matrix",
+      "",
+      `Phase: ${phase}`,
+      "",
+      "## Matrix",
+      "",
+      "| Claim | Verdict | Independence | Supporting Sources | Source Kinds | Host Count | Opposing / Qualifying Signals |",
+      "| --- | --- | --- | --- | --- | ---: | --- |",
+      matrixRows || "| none | none | none | none | none | 0 | none |",
+      "",
+      "## Summary",
+      "",
+      `- Claims checked: ${rows.length}`,
+      `- Mixed claims: ${mixedCount}`,
+      `- Claims needing corroboration: ${needsCorroborationCount}`,
+      "",
+      "## Interpretation Rules",
+      "",
+      "- `supported`: evidence is reasonably strong and no counter-signal was detected.",
+      "- `mixed`: at least one source introduces a qualifying or counter signal.",
+      "- `needs_corroboration`: claim relies on a single supporting source.",
+      "- `partially_independent`: multiple sources exist but share host or narrow source-kind diversity.",
+    ].join("\n");
+    const artifact = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "contradiction",
+      id: matrixId,
+      title: `Cross-check Matrix (${phase})`,
+      collection: "contradictions",
+      frontmatter: {
+        id: matrixId,
+        type: "contradiction",
+        phase,
+        claim_count: rows.length,
+        mixed_count: mixedCount,
+        needs_corroboration_count: needsCorroborationCount,
+        claims: rows.map((row) => row.claim.id),
+        sources: [...new Set(rows.flatMap((row) => row.supportingSources.map((source) => source.id)))],
+        tags: ["cross-check", "contradiction", phase],
+      },
+      body,
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
+    await this.options.store.appendBlackboard(
+      run.id,
+      "Cross-check Matrix",
+      `Wrote ${matrixId}; mixed=${mixedCount}, needs_corroboration=${needsCorroborationCount}.`,
+    );
     return artifact;
   }
 
