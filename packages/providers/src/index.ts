@@ -317,6 +317,7 @@ export function scoreSourceCredibility(input: {
   title: string;
   hasContent: boolean;
   providerScore?: number;
+  reputationAdjustment?: number;
 }): number {
   const baseByKind: Record<SourceKind, number> = {
     official: 0.86,
@@ -334,6 +335,9 @@ export function scoreSourceCredibility(input: {
   }
   if (input.providerScore !== undefined) {
     score += Math.min(0.06, Math.max(0, input.providerScore * 0.06));
+  }
+  if (input.reputationAdjustment !== undefined) {
+    score += input.reputationAdjustment;
   }
   if (/utm_|sponsored|affiliate/i.test(input.url + input.title)) {
     score -= 0.12;

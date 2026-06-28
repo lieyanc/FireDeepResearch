@@ -33,6 +33,13 @@ export interface MemoryBundle {
   domain: ArtifactDocument[];
 }
 
+export interface SourceReputationSignal {
+  up: number;
+  down: number;
+  adjustment: number;
+  matchedFeedback: number;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -56,6 +63,26 @@ function safeId(value: string): string {
 function extractTitle(body: string, fallback: string): string {
   const heading = body.match(/^#\s+(.+)$/m);
   return heading?.[1]?.trim() || fallback;
+}
+
+function normalizeReputationUrl(value?: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`.toLowerCase().replace(/\/$/, "");
+  } catch {
+    return value.toLowerCase().split("?")[0].replace(/\/$/, "");
+  }
+}
+
+function normalizeTitle(value: string): string {
+  return value.toLowerCase().replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function cleanFrontmatter(value: Record<string, unknown>): Record<string, unknown> {
@@ -346,6 +373,40 @@ export class MarkdownStore {
       .filter((line): line is string => line !== undefined)
       .join("\n");
     await appendFile(filePath, section);
+  }
+
+  async getSourceReputation(input: { url?: string; title: string }): Promise<SourceReputationSignal> {
+    await this.ensureBase();
+    const filePath = path.join(this.globalDir, "source_reputation.md");
+    if (!(await exists(filePath))) {
+      return { up: 0, down: 0, adjustment: 0, matchedFeedback: 0 };
+    }
+
+    const content = await readFile(filePath, "utf8");
+    const targetUrl = normalizeReputationUrl(input.url);
+    const targetTitle = normalizeTitle(input.title);
+    let up = 0;
+    let down = 0;
+
+    for (const block of content.split(/\n## Feedback /g).slice(1)) {
+      const blockUrl = normalizeReputationUrl(block.match(/^- URL:\s*(.+)$/m)?.[1]?.trim());
+      const blockTitle = normalizeTitle(block.match(/^- Title:\s*(.+)$/m)?.[1]?.trim() ?? "");
+      const rating = block.match(/^- Rating:\s*(up|down)$/m)?.[1];
+      const urlMatches = Boolean(targetUrl && blockUrl && targetUrl === blockUrl);
+      const titleMatches = Boolean(blockTitle && (targetTitle.includes(blockTitle) || blockTitle.includes(targetTitle)));
+      if (!rating || (!urlMatches && !titleMatches)) {
+        continue;
+      }
+      if (rating === "up") {
+        up += 1;
+      } else {
+        down += 1;
+      }
+    }
+
+    const matchedFeedback = up + down;
+    const adjustment = matchedFeedback === 0 ? 0 : Number(clamp((up - down) * 0.04, -0.18, 0.18).toFixed(2));
+    return { up, down, adjustment, matchedFeedback };
   }
 
   private async readLooseArtifact(filePath: string, root: string): Promise<ArtifactDocument | undefined> {

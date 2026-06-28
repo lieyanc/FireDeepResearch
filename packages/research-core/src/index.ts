@@ -177,6 +177,12 @@ function sourceToMarkdown(source: SourceRecord): string {
     "",
     `URL: ${source.url}`,
     "",
+    "## Credibility",
+    "",
+    `- Source kind: ${source.sourceKind}`,
+    `- Score: ${source.credibility}`,
+    `- Reputation adjustment: ${source.reputationAdjustment ?? 0}`,
+    "",
     "## Summary",
     "",
     source.summary,
@@ -382,6 +388,7 @@ export class ResearchController {
     await this.challengeClaims(run, claims, signal);
     const insights = await this.mineInsights(run, input, sourceResults, claims, memory, signal);
     await this.auditClaims(run, claims, sourceResults, signal);
+    await this.writeQualityAudit(run, sourceResults, claims, "initial");
     const report = await this.writeReport(run, input, sourceResults, claims, insights, memory, signal);
     run = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "run.finished", runId: run.id, reportPath: report.path, at: nowIso() });
@@ -473,6 +480,7 @@ export class ResearchController {
     const claims = await this.extractClaims(run, sourceResults, signal, { startIndex: claimStartIndex });
     await this.challengeClaims(run, claims, signal, { startIndex: questionStartIndex });
     await this.auditClaims(run, claims, sourceResults, signal, { startIndex: auditStartIndex });
+    await this.writeQualityAudit(run, sourceResults, claims, "continuation");
     const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, signal);
     const finished = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "continuation.finished", runId: finished.id, reportPath: report.path, at: nowIso() });
@@ -645,12 +653,17 @@ export class ResearchController {
           }
         }
         const sourceKind = inferSourceKind(result.url, result.title);
+        const reputation = await this.options.store.getSourceReputation({
+          url: result.url,
+          title: result.title,
+        });
         const credibility = scoreSourceCredibility({
           sourceKind,
           url: result.url,
           title: result.title,
           hasContent: content.length > 0,
           providerScore: result.score,
+          reputationAdjustment: reputation.adjustment,
         });
         const source: SourceRecord = {
           id: `source-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`,
@@ -659,6 +672,7 @@ export class ResearchController {
           provider: result.provider,
           sourceKind,
           credibility,
+          reputationAdjustment: reputation.adjustment,
           freshness: result.publishedAt,
           summary: compactText(content || result.snippet, 700),
           keyQuotes: deriveKeyQuotes(content, result.snippet),
@@ -677,6 +691,8 @@ export class ResearchController {
             url: source.url,
             source_kind: source.sourceKind,
             credibility: source.credibility,
+            reputation_adjustment: source.reputationAdjustment,
+            reputation_feedback: reputation.matchedFeedback,
             freshness: source.freshness,
             tags: source.tags,
           },
@@ -909,6 +925,120 @@ export class ResearchController {
       },
     );
     await this.options.store.appendBlackboard(run.id, "Audit", `Audited ${claims.length} claims for citation support.`);
+  }
+
+  private async writeQualityAudit(
+    run: ResearchRun,
+    sources: ReadSourceResult[],
+    claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
+    phase: "initial" | "continuation",
+  ): Promise<ArtifactRef> {
+    const sourceRecords = sources.map(({ source }) => source);
+    const averageCredibility =
+      sourceRecords.length === 0
+        ? 0
+        : Number((sourceRecords.reduce((sum, source) => sum + source.credibility, 0) / sourceRecords.length).toFixed(2));
+    const sourceMix = sourceRecords.reduce<Record<string, number>>((counts, source) => {
+      counts[source.sourceKind] = (counts[source.sourceKind] ?? 0) + 1;
+      return counts;
+    }, {});
+    const sourceKindCount = Object.keys(sourceMix).length;
+    const strongSourceCount = sourceRecords.filter((source) => source.credibility >= 0.75).length;
+    const weakSourceCount = sourceRecords.filter((source) => source.credibility < 0.55).length;
+    const reputationAdjustedCount = sourceRecords.filter((source) => (source.reputationAdjustment ?? 0) !== 0).length;
+    const verifiedClaims = claims.filter(({ claim }) => claim.status === "verified").length;
+    const challengedClaims = claims.filter(({ claim }) => claim.status !== "verified").length;
+    const qualityScore = Math.round(
+      Math.max(
+        0,
+        Math.min(
+          100,
+          averageCredibility * 45 +
+            Math.min(sourceKindCount / 4, 1) * 20 +
+            Math.min(claims.length / 4, 1) * 15 +
+            (claims.length > 0 ? 10 : 0) +
+            (strongSourceCount > 0 ? 10 : 0) -
+            weakSourceCount * 2,
+        ),
+      ),
+    );
+
+    const riskFlags = [
+      sourceRecords.length < 6 ? "Low source count; broaden search before treating the report as comprehensive." : undefined,
+      sourceKindCount < 3 ? "Limited source diversity; independent corroboration may be weak." : undefined,
+      weakSourceCount > Math.max(2, sourceRecords.length / 3) ? "Many sources have low credibility scores." : undefined,
+      challengedClaims > verifiedClaims ? "More claims are challenged than verified." : undefined,
+      strongSourceCount === 0 ? "No high-credibility source was identified in this phase." : undefined,
+    ].filter((flag): flag is string => Boolean(flag));
+
+    const existing = await this.options.store.listArtifacts(run.id);
+    const auditIndex = existing.filter((artifact) => artifact.id.startsWith("quality-audit")).length + 1;
+    const auditId = `quality-audit-${String(auditIndex).padStart(3, "0")}`;
+    const sourceMixLines = Object.entries(sourceMix)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([kind, count]) => `- ${kind}: ${count}`)
+      .join("\n");
+
+    const body = [
+      "# Quality Audit Summary",
+      "",
+      `Phase: ${phase}`,
+      "",
+      "## Score",
+      "",
+      `Quality score: **${qualityScore}/100**`,
+      "",
+      "## Evidence Coverage",
+      "",
+      `- Sources: ${sourceRecords.length}`,
+      `- Average source credibility: ${averageCredibility}`,
+      `- High-credibility sources: ${strongSourceCount}`,
+      `- Weak sources: ${weakSourceCount}`,
+      `- Reputation-adjusted sources: ${reputationAdjustedCount}`,
+      "",
+      "## Source Mix",
+      "",
+      sourceMixLines || "No sources.",
+      "",
+      "## Claim Status",
+      "",
+      `- Claims: ${claims.length}`,
+      `- Verified claims: ${verifiedClaims}`,
+      `- Challenged or weak claims: ${challengedClaims}`,
+      "",
+      "## Risk Flags",
+      "",
+      riskFlags.length > 0 ? riskFlags.map((flag) => `- ${flag}`).join("\n") : "- No high-severity structural risk detected.",
+      "",
+      "## Recommended Next Actions",
+      "",
+      "- Deepen any high-severity questions before using this as a decision memo.",
+      "- Prefer independent primary evidence for high-impact factual or causal claims.",
+      "- Use user feedback on source and citation quality to tune future credibility scoring.",
+    ].join("\n");
+
+    const artifact = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "audit",
+      id: auditId,
+      title: `Quality Audit Summary (${phase})`,
+      collection: "audits",
+      frontmatter: {
+        id: auditId,
+        type: "audit",
+        audit_kind: "quality_summary",
+        phase,
+        quality_score: qualityScore,
+        average_source_credibility: averageCredibility,
+        source_count: sourceRecords.length,
+        claim_count: claims.length,
+        risk_flag_count: riskFlags.length,
+      },
+      body,
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
+    await this.options.store.appendBlackboard(run.id, "Quality Audit", `Quality score ${qualityScore}/100 for ${phase} phase.`);
+    return artifact;
   }
 
   private async writeContinuationReport(

@@ -130,6 +130,7 @@ export const SourceRecordSchema = z.object({
   provider: z.string(),
   sourceKind: SourceKindSchema,
   credibility: z.number().min(0).max(1),
+  reputationAdjustment: z.number().min(-1).max(1).optional(),
   freshness: z.string().optional(),
   summary: z.string(),
   keyQuotes: z.array(z.string()),
