@@ -1,0 +1,28 @@
+{
+  "name": "fire-deep-research",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c cyan,magenta \"pnpm --filter @fdr/api dev\" \"pnpm --filter @fdr/web dev\"",
+    "dev:api": "pnpm --filter @fdr/api dev",
+    "dev:web": "pnpm --filter @fdr/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@vitejs/plugin-react": "5.1.1",
+    "concurrently": "9.2.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "vite": "7.2.7",
+    "vitest": "4.0.15"
+  }
+}
+

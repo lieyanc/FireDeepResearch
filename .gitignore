@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.turbo/
+.vite/
+.env
+.env.local
+coverage/
+knowledge/runs/*
+!knowledge/runs/.gitkeep
+
