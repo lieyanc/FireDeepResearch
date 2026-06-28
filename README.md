@@ -43,11 +43,15 @@ Key environment variables:
 | `FDR_MAX_SEARCH_AGENTS` | Parallel search task budget, 1-64. |
 | `FDR_MAX_READER_AGENTS` | Parallel source reading budget, 1-64. |
 | `FDR_MAX_CRITIQUE_AGENTS` | Parallel skeptic/audit budget, 1-64. |
+| `FDR_PROVIDER_TIMEOUT_MS` | Per-attempt Exa/Tavily/Firecrawl timeout, 1000-120000 ms. |
+| `FDR_PROVIDER_RETRY_ATTEMPTS` | Retry attempts for transient provider failures, 0-5. |
+| `FDR_PROVIDER_RETRY_DELAY_MS` | Linear retry delay base, 0-10000 ms. |
 | `FDR_LLM_MODEL` / `FDR_LLM_PROVIDER` | Pi model selection. Empty values use deterministic fallback output. |
 | `EXA_API_KEY`, `TAVILY_API_KEY`, `FIRECRAWL_API_KEY` | Commercial discovery and extraction providers. |
 | `VITE_API_URL` | Web app API target, default `http://localhost:8787`. |
 
 Pi model provider credentials are read by `@earendil-works/pi-ai`; common keys are included in `.env.example`.
+Provider errors are recorded in the SSE event log and the run continues with whatever sources were collected.
 
 ## Implemented MVP
 

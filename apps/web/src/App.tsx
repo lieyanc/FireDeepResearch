@@ -158,6 +158,8 @@ function eventDetail(event: ResearchEvent): string {
       return event.artifact.title;
     case "claim.challenged":
       return `${event.questionId} (${event.severity})`;
+    case "tool.finished":
+      return event.ok ? "" : event.error ?? "Tool call failed";
     case "run.failed":
       return event.error;
     case "run.finished":

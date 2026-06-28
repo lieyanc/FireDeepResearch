@@ -194,6 +194,7 @@ export const ResearchEventSchema = z.discriminatedUnion("type", [
     tool: z.string(),
     taskId: z.string(),
     ok: z.boolean(),
+    error: z.string().optional(),
     at: z.string(),
   }),
   z.object({

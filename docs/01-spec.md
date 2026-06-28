@@ -486,6 +486,9 @@ FDR_USE_MOCK_PROVIDERS=auto
 FDR_MAX_SEARCH_AGENTS=6
 FDR_MAX_READER_AGENTS=10
 FDR_MAX_CRITIQUE_AGENTS=4
+FDR_PROVIDER_TIMEOUT_MS=20000
+FDR_PROVIDER_RETRY_ATTEMPTS=2
+FDR_PROVIDER_RETRY_DELAY_MS=400
 FDR_LLM_PROVIDER=
 FDR_LLM_MODEL=
 EXA_API_KEY=
@@ -495,6 +498,8 @@ VITE_API_URL=http://localhost:8787
 ```
 
 Pi model provider credentials, such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, Azure OpenAI, Mistral, Groq, or OpenRouter keys, are loaded by `@earendil-works/pi-ai` according to the selected model provider.
+
+Commercial provider calls use per-attempt timeout and retry settings. Search/fetch failures are emitted as structured tool events with an error message, and the run continues with partial evidence unless all later stages have no usable artifacts.
 
 ## MVP Milestones
 

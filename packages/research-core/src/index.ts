@@ -70,6 +70,10 @@ function compactText(value: string, maxLength: number): string {
   return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength - 1)}...`;
 }
 
+function compactError(error: unknown): string {
+  return compactText(error instanceof Error ? error.message : String(error), 500);
+}
+
 function sourceHost(url: string): string {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -623,13 +627,14 @@ export class ResearchController {
             at: nowIso(),
           });
           return results;
-        } catch {
+        } catch (error) {
           await this.emit({
             type: "tool.finished",
             runId: run.id,
             tool: `${provider.name}.search`,
             taskId,
             ok: false,
+            error: compactError(error),
             at: nowIso(),
           });
           return [];
@@ -668,13 +673,14 @@ export class ResearchController {
               ok: true,
               at: nowIso(),
             });
-          } catch {
+          } catch (error) {
             await this.emit({
               type: "tool.finished",
               runId: run.id,
               tool: `${this.options.providers.fetchProvider.name}.fetch`,
               taskId,
               ok: false,
+              error: compactError(error),
               at: nowIso(),
             });
           }
