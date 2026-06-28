@@ -239,7 +239,7 @@ export class MockSearchProvider implements SearchProvider {
       title: `${item.title} (${query.task.angle})`,
       url: `${item.url}?angle=${encodeURIComponent(query.task.angle)}&q=${encodeURIComponent(normalized.slice(0, 40))}`,
       snippet: item.snippet,
-      content: `Research query: ${query.task.query}\n\n${item.content}`,
+      content: item.content,
       score: 1 - index * 0.08,
     }));
     return ranked.slice(0, query.maxResults);
@@ -340,4 +340,3 @@ export function scoreSourceCredibility(input: {
   }
   return Math.max(0.05, Math.min(0.98, Number(score.toFixed(2))));
 }
-

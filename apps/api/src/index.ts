@@ -2,7 +2,7 @@ import { serve } from "@hono/node-server";
 import { MarkdownStore, getDefaultDataDir } from "@fdr/knowledge";
 import { createProviderRegistryFromEnv } from "@fdr/providers";
 import { ResearchController } from "@fdr/research-core";
-import { FeedbackRequestSchema, RunCreateRequestSchema, type ResearchEvent } from "@fdr/schemas";
+import { ContinueRunRequestSchema, FeedbackRequestSchema, RunCreateRequestSchema, type ResearchEvent } from "@fdr/schemas";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
@@ -147,6 +147,12 @@ app.post("/api/runs/:runId/feedback", async (c) => {
   return c.json({ artifact }, 201);
 });
 
+app.post("/api/runs/:runId/continue", async (c) => {
+  const input = await parseJson(c.req.raw, (value) => ContinueRunRequestSchema.parse(value));
+  const run = await research.continueRun(c.req.param("runId"), input);
+  return c.json({ run }, 202);
+});
+
 app.post("/api/runs/:runId/cancel", (c) => {
   const cancelled = research.cancelRun(c.req.param("runId"));
   return c.json({ cancelled });
@@ -173,4 +179,3 @@ serve(
 );
 
 export { app, research };
-

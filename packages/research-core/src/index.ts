@@ -10,6 +10,7 @@ import {
   type ArtifactRef,
   type ClaimKind,
   type ClaimRecord,
+  type ContinueRunRequest,
   type FeedbackRequest,
   type ResearchEvent,
   type ResearchRun,
@@ -31,9 +32,13 @@ interface RunInput extends RunCreateRequest {
   domain?: string;
 }
 
+interface ContinueInput extends ContinueRunRequest {
+  domain?: string;
+}
+
 interface RunState {
   run: ResearchRun;
-  input: RunInput;
+  input: RunInput | ContinueInput;
   abortController: AbortController;
   promise: Promise<void>;
 }
@@ -63,6 +68,15 @@ function slugFragment(value: string): string {
 function compactText(value: string, maxLength: number): string {
   const trimmed = value.replace(/\s+/g, " ").trim();
   return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength - 1)}...`;
+}
+
+function stripMarkdown(value: string): string {
+  return value
+    .replace(/^---[\s\S]*?---/m, "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[#>*_`[\]()-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function uniqueByUrl(results: SearchResult[]): SearchResult[] {
@@ -281,7 +295,9 @@ export class ResearchController {
   }
 
   async addFeedback(runId: string, feedback: FeedbackRequest): Promise<ArtifactRef> {
+    const target = await this.options.store.readArtifactById(runId, feedback.artifactId);
     const artifact = await this.options.store.appendFeedback(runId, feedback);
+    await this.options.store.appendSourceReputationFeedback({ runId, feedback, artifact: target });
     await this.emit({ type: "artifact.created", runId, artifact, at: nowIso() });
     return artifact;
   }
@@ -305,6 +321,33 @@ export class ResearchController {
     this.activeRuns.set(run.id, { run, input, abortController, promise });
     promise.finally(() => this.activeRuns.delete(run.id)).catch(() => undefined);
     return run;
+  }
+
+  async continueRun(runId: string, input: ContinueInput): Promise<ResearchRun> {
+    const run = await this.options.store.readRun(runId);
+    if (!run) {
+      throw new Error(`Run not found: ${runId}`);
+    }
+    if (this.activeRuns.has(runId)) {
+      throw new Error(`Run is already active: ${runId}`);
+    }
+    const abortController = new AbortController();
+    const running = await this.updateRunStatus(run, "running");
+    const promise = this.executeContinuation(running, input, abortController.signal).catch(async (error: unknown) => {
+      await this.emit({
+        type: "run.failed",
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+        at: nowIso(),
+      });
+      const latest = await this.options.store.readRun(runId);
+      if (latest) {
+        await this.options.store.updateRun({ ...latest, status: "failed" });
+      }
+    });
+    this.activeRuns.set(runId, { run: running, input, abortController, promise });
+    promise.finally(() => this.activeRuns.delete(runId)).catch(() => undefined);
+    return running;
   }
 
   cancelRun(runId: string): boolean {
@@ -342,6 +385,97 @@ export class ResearchController {
     const report = await this.writeReport(run, input, sourceResults, claims, insights, memory, signal);
     run = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "run.finished", runId: run.id, reportPath: report.path, at: nowIso() });
+  }
+
+  private async executeContinuation(run: ResearchRun, input: ContinueInput, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const memory = await this.options.store.loadMemory(input.domain);
+    const artifacts = await this.options.store.listArtifacts(run.id);
+    const question = input.questionId ? await this.options.store.readArtifactById(run.id, input.questionId) : undefined;
+    const focus = input.prompt ?? question?.body ?? "Deepen the strongest unresolved question in this run.";
+    const questionId = input.questionId ?? question?.id;
+    await this.emit({
+      type: "continuation.started",
+      runId: run.id,
+      questionId,
+      prompt: compactText(stripMarkdown(focus), 500),
+      at: nowIso(),
+    });
+
+    const providerNames = this.options.providers.searchProviders.map((provider) => provider.name);
+    const cleanFocus = compactText(stripMarkdown(focus), 600);
+    const maxSearchTasks = input.maxSearchTasks ?? 3;
+    const tasks: SearchTask[] = [
+      {
+        id: "followup-search-1",
+        angle: "independent corroboration for challenged claim",
+        query: `${run.query} ${cleanFocus} independent corroboration primary evidence`,
+        priority: 0.95,
+        providers: providerNames
+          .map((name) => (name === "mock" ? "mock" : name))
+          .filter((name) => name === "exa" || name === "tavily" || name === "mock"),
+      },
+      {
+        id: "followup-search-2",
+        angle: "counter evidence and contradiction search",
+        query: `${run.query} ${cleanFocus} contradiction counterexample risk`,
+        priority: 0.85,
+        providers: providerNames
+          .map((name) => (name === "mock" ? "mock" : name))
+          .filter((name) => name === "exa" || name === "tavily" || name === "mock"),
+      },
+      {
+        id: "followup-search-3",
+        angle: "weak signal and novel insight search",
+        query: `${run.query} ${cleanFocus} weak signal adoption evidence insight`,
+        priority: 0.75,
+        providers: providerNames
+          .map((name) => (name === "mock" ? "mock" : name))
+          .filter((name) => name === "exa" || name === "tavily" || name === "mock"),
+      },
+    ].slice(0, maxSearchTasks);
+
+    const critiqueId = `deep-dive-${String(artifacts.filter((artifact) => artifact.kind === "critique").length + 1).padStart(3, "0")}`;
+    const critique = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "critique",
+      id: critiqueId,
+      title: "Follow-up Deep Dive Request",
+      collection: "critiques",
+      frontmatter: {
+        id: critiqueId,
+        type: "critique",
+        question_id: questionId,
+        search_task_count: tasks.length,
+      },
+      body: [
+        "# Follow-up Deep Dive Request",
+        "",
+        "## Focus",
+        "",
+        cleanFocus,
+        "",
+        "## Search Tasks",
+        "",
+        ...tasks.map((task) => `- **${task.id}** (${task.angle}): ${task.query}`),
+      ].join("\n"),
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact: critique, at: nowIso() });
+    await this.options.store.appendBlackboard(run.id, "Continuation", `Started follow-up deep dive for ${questionId ?? "manual prompt"}.`);
+
+    const sourceStartIndex = artifacts.filter((artifact) => artifact.kind === "source").length;
+    const claimStartIndex = artifacts.filter((artifact) => artifact.kind === "claim").length;
+    const questionStartIndex = artifacts.filter((artifact) => artifact.kind === "question").length;
+    const auditStartIndex = artifacts.filter((artifact) => artifact.kind === "audit").length;
+
+    const searchResults = await this.search(run, tasks, signal);
+    const sourceResults = await this.readSources(run, searchResults.slice(0, 8), signal, { startIndex: sourceStartIndex });
+    const claims = await this.extractClaims(run, sourceResults, signal, { startIndex: claimStartIndex });
+    await this.challengeClaims(run, claims, signal, { startIndex: questionStartIndex });
+    await this.auditClaims(run, claims, sourceResults, signal, { startIndex: auditStartIndex });
+    const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, signal);
+    const finished = await this.updateRunStatus(run, "finished");
+    await this.emit({ type: "continuation.finished", runId: finished.id, reportPath: report.path, at: nowIso() });
   }
 
   private async runRole(
@@ -476,6 +610,7 @@ export class ResearchController {
     run: ResearchRun,
     results: SearchResult[],
     signal: AbortSignal,
+    options: { startIndex?: number } = {},
   ): Promise<ReadSourceResult[]> {
     signal.throwIfAborted();
     const readResults = await mapWithConcurrency(
@@ -518,7 +653,7 @@ export class ResearchController {
           providerScore: result.score,
         });
         const source: SourceRecord = {
-          id: `source-${String(index + 1).padStart(3, "0")}`,
+          id: `source-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`,
           title: result.title,
           url: result.url,
           provider: result.provider,
@@ -560,11 +695,12 @@ export class ResearchController {
     run: ResearchRun,
     sources: ReadSourceResult[],
     signal: AbortSignal,
+    options: { startIndex?: number } = {},
   ): Promise<Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>> {
     signal.throwIfAborted();
     const taskId = makeTaskId("claims");
     await this.emit({ type: "agent.started", runId: run.id, agent: "claim-extractor", taskId, label: "Extract claims", at: nowIso() });
-    const claims = sources.slice(0, 8).map(({ source }, index) => makeClaimFromSource(source, index));
+    const claims = sources.slice(0, 8).map(({ source }, index) => makeClaimFromSource(source, (options.startIndex ?? 0) + index));
     const deduped = claims.filter((claim, index, all) => all.findIndex((other) => other.text === claim.text) === index);
     const artifacts = await Promise.all(
       deduped.map(async (claim) => {
@@ -600,6 +736,7 @@ export class ResearchController {
     run: ResearchRun,
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
     signal: AbortSignal,
+    options: { startIndex?: number } = {},
   ): Promise<void> {
     await mapWithConcurrency(
       claims,
@@ -609,7 +746,7 @@ export class ResearchController {
         const taskId = `skeptic-${claim.id}`;
         await this.emit({ type: "agent.started", runId: run.id, agent: "skeptic", taskId, label: `Challenge ${claim.id}`, at: nowIso() });
         const severity = claim.confidence < 0.7 ? "high" : "medium";
-        const questionId = `question-${String(index + 1).padStart(3, "0")}`;
+        const questionId = `question-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`;
         const question = [
           "# Question",
           "",
@@ -722,6 +859,7 @@ export class ResearchController {
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
     _sources: ReadSourceResult[],
     signal: AbortSignal,
+    options: { startIndex?: number } = {},
   ): Promise<void> {
     await mapWithConcurrency(
       claims,
@@ -731,7 +869,7 @@ export class ResearchController {
         const taskId = `audit-${claim.id}`;
         await this.emit({ type: "agent.started", runId: run.id, agent: "citation-auditor", taskId, label: `Audit ${claim.id}`, at: nowIso() });
         const support = claim.confidence >= 0.75 ? "supported" : claim.confidence >= 0.55 ? "partially_supported" : "weak";
-        const auditId = `audit-${String(index + 1).padStart(3, "0")}`;
+        const auditId = `audit-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`;
         const body = [
           "# Citation Audit",
           "",
@@ -771,6 +909,84 @@ export class ResearchController {
       },
     );
     await this.options.store.appendBlackboard(run.id, "Audit", `Audited ${claims.length} claims for citation support.`);
+  }
+
+  private async writeContinuationReport(
+    run: ResearchRun,
+    focus: string,
+    sources: ReadSourceResult[],
+    claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
+    signal: AbortSignal,
+  ): Promise<ArtifactRef> {
+    const existingReports = (await this.options.store.listArtifacts(run.id)).filter((artifact) => artifact.kind === "report");
+    const reportIndex = existingReports.length + 1;
+    const reportId = `followup-report-${String(reportIndex).padStart(3, "0")}`;
+    const context = `<followup_focus>\n${focus}\n</followup_focus>\n\n<new_claims>\n${claims
+      .map(({ claim }) => `- ${claim.id} (${claim.status}, ${claim.confidence}): ${claim.text}`)
+      .join("\n")}\n</new_claims>\n\n<new_sources>\n${sources
+      .map(({ source }) => `- ${source.id} (${source.sourceKind}, ${source.credibility}): ${source.title}`)
+      .join("\n")}\n</new_sources>`;
+    const modelText = await this.runRole(
+      run,
+      "report-writer",
+      "Write follow-up deep dive report",
+      "Write a focused continuation report. State whether the new evidence strengthens, weakens, or reframes the challenged claim.",
+      context,
+      signal,
+    );
+    const body = [
+      "# Follow-up Deep Dive Report",
+      "",
+      "## Focus",
+      "",
+      focus,
+      "",
+      "## Evidence Movement",
+      "",
+      claims.length > 0
+        ? "The continuation added new claims and citations. Treat these as incremental evidence rather than a replacement for the original report."
+        : "The continuation did not extract enough new evidence to change the report confidence.",
+      "",
+      "## New Claims",
+      "",
+      claims
+        .map(
+          ({ claim }) =>
+            `- **${claim.id}** (${claim.status}, confidence ${claim.confidence}): ${claim.text} Sources: ${claim.sources
+              .map((sourceId) => `\`${sourceId}\``)
+              .join(", ")}`,
+        )
+        .join("\n") || "No new claims.",
+      "",
+      "## New Sources",
+      "",
+      sources
+        .map(({ source }) => `- **${source.id}** [${source.sourceKind}, ${source.credibility}] ${source.title} - ${source.url}`)
+        .join("\n") || "No new sources.",
+      "",
+      "## Writer Notes",
+      "",
+      modelText,
+    ].join("\n");
+    const artifact = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "report",
+      id: reportId,
+      title: "Follow-up Deep Dive Report",
+      filename: `${reportId}.md`,
+      frontmatter: {
+        id: reportId,
+        type: "report",
+        report_kind: "followup",
+        claim_count: claims.length,
+        source_count: sources.length,
+        tags: ["followup", "deep-dive"],
+      },
+      body,
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
+    await this.options.store.appendBlackboard(run.id, "Continuation Report", `Wrote ${reportId}.`);
+    return artifact;
   }
 
   private async writeReport(
@@ -859,4 +1075,3 @@ export class ResearchController {
     return artifact;
   }
 }
-

@@ -272,6 +272,12 @@ export class MarkdownStore {
     };
   }
 
+  async readArtifactById(runId: string, artifactId: string): Promise<ArtifactDocument | undefined> {
+    const artifacts = await this.listArtifacts(runId);
+    const match = artifacts.find((artifact) => artifact.id === artifactId);
+    return match ? this.readArtifact(runId, match.path) : undefined;
+  }
+
   async listArtifacts(runId: string): Promise<ArtifactRef[]> {
     const root = this.runDir(runId);
     const files = (await walkFiles(root)).filter((file) => file.endsWith(".md"));
@@ -311,6 +317,35 @@ export class MarkdownStore {
       },
       body: `# Feedback on ${feedback.artifactId}\n\n- Rating: ${feedback.rating}\n- Dimension: ${feedback.dimension}\n\n${feedback.note ?? ""}\n`,
     });
+  }
+
+  async appendSourceReputationFeedback(input: {
+    runId: string;
+    feedback: FeedbackRequest;
+    artifact?: ArtifactDocument;
+  }): Promise<void> {
+    await this.ensureBase();
+    const filePath = path.join(this.globalDir, "source_reputation.md");
+    const artifact = input.artifact;
+    const url = typeof artifact?.frontmatter.url === "string" ? artifact.frontmatter.url : undefined;
+    const title = artifact?.title ?? input.feedback.artifactId;
+    const timestamp = nowIso();
+    const section = [
+      "",
+      `## Feedback ${timestamp}`,
+      "",
+      `- Run: ${input.runId}`,
+      `- Artifact: ${input.feedback.artifactId}`,
+      `- Title: ${title}`,
+      url ? `- URL: ${url}` : undefined,
+      `- Rating: ${input.feedback.rating}`,
+      `- Dimension: ${input.feedback.dimension}`,
+      input.feedback.note ? `- Note: ${input.feedback.note}` : undefined,
+      "",
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    await appendFile(filePath, section);
   }
 
   private async readLooseArtifact(filePath: string, root: string): Promise<ArtifactDocument | undefined> {

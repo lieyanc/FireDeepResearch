@@ -220,6 +220,19 @@ export const ResearchEventSchema = z.discriminatedUnion("type", [
     at: z.string(),
   }),
   z.object({
+    type: z.literal("continuation.started"),
+    runId: z.string(),
+    questionId: z.string().optional(),
+    prompt: z.string(),
+    at: z.string(),
+  }),
+  z.object({
+    type: z.literal("continuation.finished"),
+    runId: z.string(),
+    reportPath: z.string(),
+    at: z.string(),
+  }),
+  z.object({
     type: z.literal("run.failed"),
     runId: z.string(),
     error: z.string(),
@@ -237,6 +250,14 @@ export const RunCreateRequestSchema = z.object({
 
 export type RunCreateRequest = z.infer<typeof RunCreateRequestSchema>;
 
+export const ContinueRunRequestSchema = z.object({
+  questionId: z.string().optional(),
+  prompt: z.string().min(3).optional(),
+  maxSearchTasks: z.number().int().min(1).max(6).optional(),
+});
+
+export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;
+
 export const FeedbackRequestSchema = z.object({
   artifactId: z.string(),
   rating: z.enum(["up", "down"]),
@@ -253,4 +274,3 @@ export const DEFAULT_LIMITS = {
   maxCritiqueAgents: 4,
   maxProviderRequestsPerProvider: 4,
 } as const;
-

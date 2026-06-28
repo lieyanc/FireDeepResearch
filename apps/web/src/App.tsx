@@ -92,6 +92,10 @@ function eventLabel(event: ResearchEvent): string {
       return `${event.insightId} created`;
     case "run.finished":
       return "Run finished";
+    case "continuation.started":
+      return "Continuation started";
+    case "continuation.finished":
+      return "Continuation finished";
     case "run.failed":
       return "Run failed";
   }
@@ -103,6 +107,9 @@ function eventIcon(event: ResearchEvent) {
   }
   if (event.type === "insight.created") {
     return <Lightbulb size={15} />;
+  }
+  if (event.type.startsWith("continuation")) {
+    return <Sparkles size={15} />;
   }
   if (event.type === "claim.challenged") {
     return <MessageSquareWarning size={15} />;
@@ -130,6 +137,10 @@ function eventDetail(event: ResearchEvent): string {
     case "run.failed":
       return event.error;
     case "run.finished":
+      return event.reportPath;
+    case "continuation.started":
+      return event.questionId ? `${event.questionId}: ${event.prompt}` : event.prompt;
+    case "continuation.finished":
       return event.reportPath;
     default:
       return "";
@@ -175,6 +186,7 @@ export function App() {
   const [activeTab, setActiveTab] = useState<ArtifactTab>("report");
   const [health, setHealth] = useState<HealthState>();
   const [isStarting, setIsStarting] = useState(false);
+  const [isContinuing, setIsContinuing] = useState(false);
   const [error, setError] = useState<string>();
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -260,6 +272,8 @@ export function App() {
       "claim.challenged",
       "insight.created",
       "run.finished",
+      "continuation.started",
+      "continuation.finished",
       "run.failed",
     ];
     for (const name of eventNames) {
@@ -312,6 +326,32 @@ export function App() {
       dimension: selectedArtifact.kind === "source" ? "credibility" : selectedArtifact.kind === "insight" ? "insight_value" : "usefulness",
     });
     await refreshArtifacts(selectedRunId);
+  }
+
+  async function continueFromArtifact() {
+    if (!selectedRunId || !selectedArtifact) {
+      return;
+    }
+    setError(undefined);
+    setIsContinuing(true);
+    try {
+      const input =
+        selectedArtifact.kind === "question"
+          ? { questionId: selectedArtifact.id, maxSearchTasks: 3 }
+          : {
+              prompt: `Deepen this artifact and look for independent corroboration, contradictions, and new insight:\n\n${selectedArtifact.body.slice(
+                0,
+                1_500,
+              )}`,
+              maxSearchTasks: 3,
+            };
+      const payload = await api.continueRun(selectedRunId, input);
+      setRuns((current) => current.map((run) => (run.id === payload.run.id ? payload.run : run)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsContinuing(false);
+    }
   }
 
   const activeAgents = useMemo(() => {
@@ -497,6 +537,15 @@ export function App() {
             </div>
             {selectedArtifact ? (
               <div className="feedback-buttons">
+                <button
+                  className="ghost-button"
+                  onClick={continueFromArtifact}
+                  disabled={isContinuing || selectedRun?.status === "running"}
+                  title="Deepen this artifact"
+                >
+                  {isContinuing ? <RefreshCw size={15} className="spin" /> : <Sparkles size={15} />}
+                  Deepen
+                </button>
                 <button className="icon-button" onClick={() => sendFeedback("up")} title="Upvote">
                   <ThumbsUp size={15} />
                 </button>

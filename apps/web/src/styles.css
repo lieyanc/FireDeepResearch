@@ -299,6 +299,11 @@ button {
   padding: 0 10px;
 }
 
+.ghost-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .icon-button {
   width: 34px;
   height: 34px;
@@ -717,4 +722,3 @@ button {
     max-height: 620px;
   }
 }
-

@@ -1,4 +1,12 @@
-import type { ArtifactDocument, ArtifactRef, FeedbackRequest, ResearchEvent, ResearchRun, RunCreateRequest } from "@fdr/schemas";
+import type {
+  ArtifactDocument,
+  ArtifactRef,
+  ContinueRunRequest,
+  FeedbackRequest,
+  ResearchEvent,
+  ResearchRun,
+  RunCreateRequest,
+} from "@fdr/schemas";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8787";
 
@@ -60,6 +68,13 @@ export const api = {
     });
   },
 
+  continueRun(runId: string, input: ContinueRunRequest) {
+    return request<{ run: ResearchRun }>(`/api/runs/${encodeURIComponent(runId)}/continue`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  },
+
   cancelRun(runId: string) {
     return request<{ cancelled: boolean }>(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
       method: "POST",
@@ -70,4 +85,3 @@ export const api = {
     return new EventSource(`${API_URL}/api/runs/${encodeURIComponent(runId)}/events`);
   },
 };
-

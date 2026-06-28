@@ -38,6 +38,8 @@ The mock provider mode runs without API keys and still exercises the full pipeli
 - Provider adapters for Exa, Tavily, and Firecrawl, plus mock adapters for local demos.
 - Research controller with staged multi-agent pipeline: planner, search, source reader, claim extractor, skeptic, insight miner, citation auditor, report writer.
 - Default parallel execution for search, reading, critique, and audit phases.
+- Follow-up deep-dive continuation from a selected question or artifact, producing additional sources, claims, audits, and a focused follow-up report.
+- Human feedback artifacts that also update global Markdown source reputation memory.
 - SSE event streaming for live run updates.
 - shadcn-style research cockpit with run list, live room timeline, artifact tabs, evidence detail panel, and feedback controls.
 
@@ -51,3 +53,4 @@ pnpm test
 ```
 
 Smoke-tested with `FDR_USE_MOCK_PROVIDERS=true` by creating a run through the API and verifying the generated Markdown artifacts under `knowledge/runs`.
+Also smoke-tested `/api/runs/:runId/continue` from a generated question and feedback persistence into `knowledge/global/source_reputation.md`.
