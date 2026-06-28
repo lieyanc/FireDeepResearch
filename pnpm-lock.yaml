@@ -57,6 +57,21 @@ importers:
         specifier: workspace:*
         version: link:../schemas
 
+  packages/research-core:
+    dependencies:
+      '@fdr/agent-runtime':
+        specifier: workspace:*
+        version: link:../agent-runtime
+      '@fdr/knowledge':
+        specifier: workspace:*
+        version: link:../knowledge
+      '@fdr/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@fdr/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
   packages/schemas:
     dependencies:
       zod:
