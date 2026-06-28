@@ -308,6 +308,10 @@ export class ResearchController {
     return this.options.store.readArtifact(runId, artifactPath);
   }
 
+  getLimits(): Record<keyof typeof DEFAULT_LIMITS, number> {
+    return { ...this.limits };
+  }
+
   async addFeedback(runId: string, feedback: FeedbackRequest): Promise<ArtifactRef> {
     const target = await this.options.store.readArtifactById(runId, feedback.artifactId);
     const artifact = await this.options.store.appendFeedback(runId, feedback);

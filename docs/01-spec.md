@@ -480,14 +480,21 @@ Important UI behaviors:
 Environment variables:
 
 ```text
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
+FDR_API_PORT=8787
+FDR_DATA_DIR=./knowledge
+FDR_USE_MOCK_PROVIDERS=auto
+FDR_MAX_SEARCH_AGENTS=6
+FDR_MAX_READER_AGENTS=10
+FDR_MAX_CRITIQUE_AGENTS=4
+FDR_LLM_PROVIDER=
+FDR_LLM_MODEL=
 EXA_API_KEY=
 TAVILY_API_KEY=
 FIRECRAWL_API_KEY=
-FDR_DATA_DIR=./knowledge
-FDR_MAX_CONCURRENT_LLM_CALLS=8
+VITE_API_URL=http://localhost:8787
 ```
+
+Pi model provider credentials, such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, Azure OpenAI, Mistral, Groq, or OpenRouter keys, are loaded by `@earendil-works/pi-ai` according to the selected model provider.
 
 ## MVP Milestones
 
@@ -533,4 +540,3 @@ FDR_MAX_CONCURRENT_LLM_CALLS=8
 - How should we summarize blackboard state when context grows too large?
 - Should user feedback immediately mutate source reputation, or wait for a curator step?
 - What is the minimum artifact schema needed for a strong hackathon demo?
-

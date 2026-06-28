@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { MarkdownStore, getDefaultDataDir } from "@fdr/knowledge";
 import { createProviderRegistryFromEnv } from "@fdr/providers";
@@ -7,11 +8,12 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { ZodError } from "zod";
+import { readResearchLimitsFromEnv } from "./config";
 
 const app = new Hono();
 const store = new MarkdownStore({ dataDir: getDefaultDataDir() });
 const providers = createProviderRegistryFromEnv();
-const research = new ResearchController({ store, providers });
+const research = new ResearchController({ store, providers, limits: readResearchLimitsFromEnv() });
 
 function jsonError(message: string, status = 400) {
   return new HTTPException(status as 400, { message });
@@ -41,14 +43,20 @@ app.use(
   }),
 );
 
-app.get("/api/health", (c) =>
-  c.json({
+app.get("/api/health", (c) => {
+  const limits = research.getLimits();
+  return c.json({
     ok: true,
     dataDir: store.dataDir,
     searchProviders: providers.searchProviders.map((provider) => provider.name),
     fetchProvider: providers.fetchProvider.name,
-  }),
-);
+    researchLimits: {
+      maxSearchAgents: limits.maxSearchAgents,
+      maxReaderAgents: limits.maxReaderAgents,
+      maxCritiqueAgents: limits.maxCritiqueAgents,
+    },
+  });
+});
 
 app.get("/api/runs", async (c) => {
   return c.json({ runs: await research.listRuns() });

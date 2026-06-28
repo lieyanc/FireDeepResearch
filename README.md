@@ -20,7 +20,8 @@ Initial planning docs:
 
 ```bash
 pnpm install
-FDR_USE_MOCK_PROVIDERS=true pnpm dev
+cp .env.example .env
+pnpm dev
 ```
 
 Then open:
@@ -28,7 +29,25 @@ Then open:
 - Web cockpit: http://localhost:5173
 - API health: http://localhost:8787/api/health
 
-The mock provider mode runs without API keys and still exercises the full pipeline. To use commercial providers, copy `.env.example`, set the provider keys, and run with `FDR_USE_MOCK_PROVIDERS=false`.
+The default `.env.example` uses `FDR_USE_MOCK_PROVIDERS=auto`: with no Exa/Tavily key it runs a zero-key mock demo, and with commercial keys it uses the configured providers. The API health endpoint reports active search/fetch providers and effective research concurrency limits.
+
+## Runtime Configuration
+
+Key environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `FDR_API_PORT` | Hono API port, default `8787`. |
+| `FDR_DATA_DIR` | Markdown knowledge root, default `./knowledge`. |
+| `FDR_USE_MOCK_PROVIDERS` | `auto`, `true`, or `false` provider selection. |
+| `FDR_MAX_SEARCH_AGENTS` | Parallel search task budget, 1-64. |
+| `FDR_MAX_READER_AGENTS` | Parallel source reading budget, 1-64. |
+| `FDR_MAX_CRITIQUE_AGENTS` | Parallel skeptic/audit budget, 1-64. |
+| `FDR_LLM_MODEL` / `FDR_LLM_PROVIDER` | Pi model selection. Empty values use deterministic fallback output. |
+| `EXA_API_KEY`, `TAVILY_API_KEY`, `FIRECRAWL_API_KEY` | Commercial discovery and extraction providers. |
+| `VITE_API_URL` | Web app API target, default `http://localhost:8787`. |
+
+Pi model provider credentials are read by `@earendil-works/pi-ai`; common keys are included in `.env.example`.
 
 ## Implemented MVP
 
@@ -52,6 +71,7 @@ The mock provider mode runs without API keys and still exercises the full pipeli
 Current checks:
 
 ```bash
+pnpm typecheck
 pnpm build
 pnpm test
 ```

@@ -58,6 +58,10 @@ afterEach(async () => {
 describe("ResearchController mock pipeline", () => {
   it("generates the core auditable artifact set for a run", async () => {
     const { controller, store, dir } = await makeController();
+    expect(controller.getLimits().maxSearchAgents).toBe(3);
+    expect(controller.getLimits().maxReaderAgents).toBe(4);
+    expect(controller.getLimits().maxCritiqueAgents).toBe(2);
+
     const run = await controller.createRun({
       query: "Research auditable multi-agent DeepResearch reliability",
       maxSearchTasks: 2,
