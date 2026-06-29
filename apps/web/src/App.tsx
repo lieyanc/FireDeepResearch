@@ -12,11 +12,13 @@ import {
   History,
   Lightbulb,
   MessageSquareWarning,
+  Moon,
   PauseCircle,
   RefreshCw,
   Search,
   ShieldCheck,
   Sparkles,
+  Sun,
   ThumbsDown,
   ThumbsUp,
 } from "lucide-react";
@@ -28,6 +30,7 @@ import { MarkdownView } from "./MarkdownView";
 
 type ArtifactTab = "report" | "ledger" | "check" | "claim" | "source" | "question" | "insight" | "audit" | "memory";
 type StreamState = "idle" | "connecting" | "live" | "reconnecting" | "closed";
+type ThemeMode = "light" | "dark";
 
 interface HealthState {
   ok: boolean;
@@ -48,6 +51,7 @@ interface HealthState {
 
 const SAMPLE_QUERY =
   "Research the 2026 AI coding agent market and identify which startups or product strategies have the strongest enterprise opportunity.";
+const THEME_STORAGE_KEY = "fdr-theme";
 
 const tabLabels: Record<ArtifactTab, string> = {
   report: "Report",
@@ -84,6 +88,17 @@ const feedbackDimensionLabels: Record<FeedbackRequest["dimension"], string> = {
 
 function cn(...values: Array<string | false | undefined>): string {
   return values.filter(Boolean).join(" ");
+}
+
+function getInitialTheme(): ThemeMode {
+  if (typeof window === "undefined") {
+    return "light";
+  }
+  const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (savedTheme === "light" || savedTheme === "dark") {
+    return savedTheme;
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
 function formatLlmRuntime(health?: HealthState): string {
@@ -315,6 +330,7 @@ function isTerminalRunEvent(event: ResearchEvent): boolean {
 }
 
 export function App() {
+  const [theme, setTheme] = useState<ThemeMode>(getInitialTheme);
   const [query, setQuery] = useState(SAMPLE_QUERY);
   const [domain, setDomain] = useState("ai-coding-agents");
   const [runs, setRuns] = useState<ResearchRun[]>([]);
@@ -402,6 +418,13 @@ export function App() {
       .filter((artifact) => artifact.kind === "report")
       .sort((a, b) => artifactTime(b) - artifactTime(a) || b.path.localeCompare(a.path))[0];
   }, [artifacts]);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    document.documentElement.classList.toggle("light", theme === "light");
+    document.documentElement.style.colorScheme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   const refreshRuns = useCallback(async () => {
     const payload = await api.listRuns();
@@ -666,10 +689,19 @@ export function App() {
           <div className="brand-mark">
             <Flame size={18} />
           </div>
-          <div>
+          <div className="brand-copy">
             <div className="brand-title">FireDeepResearch</div>
             <div className="brand-subtitle">Markdown-native</div>
           </div>
+          <button
+            className="icon-button theme-toggle"
+            type="button"
+            onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          >
+            {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
         </div>
 
         <div className="status-grid">
