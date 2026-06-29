@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { RoleRunner } from "@fdr/agent-runtime";
 import { createHybridRoleRunner } from "@fdr/agent-runtime";
-import type { MarkdownStore, MemoryBundle } from "@fdr/knowledge";
+import type { ArtifactIndexEntry, MarkdownStore, MemoryBundle } from "@fdr/knowledge";
 import type { ProviderRegistry, SearchResult } from "@fdr/providers";
 import { inferSourceKind, scoreSourceCredibility } from "@fdr/providers";
 import {
   DEFAULT_LIMITS,
   type AgentRole,
+  type ArtifactDocument,
   type ArtifactRef,
   type ClaimKind,
   type ClaimRecord,
@@ -48,8 +49,27 @@ interface ReadSourceResult {
   artifact: ArtifactRef;
 }
 
+interface ClaimArtifactResult {
+  claim: ClaimRecord;
+  source: SourceRecord;
+  artifact: ArtifactRef;
+}
+
+interface AutoDeepDiveResult {
+  questionId?: string;
+  critique?: ArtifactRef;
+  sources: ReadSourceResult[];
+  claims: ClaimArtifactResult[];
+}
+
+type ResearchPhase = "initial" | "continuation" | "auto_deep_dive";
+
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Date.now() - startedAt);
 }
 
 function makeTaskId(prefix: string): string {
@@ -74,6 +94,19 @@ function compactError(error: unknown): string {
   return compactText(error instanceof Error ? error.message : String(error), 500);
 }
 
+function isAbortError(error: unknown): boolean {
+  if (error instanceof Error) {
+    return error.name === "AbortError" || /aborted|cancelled|canceled/i.test(error.message);
+  }
+  return /aborted|cancelled|canceled/i.test(String(error));
+}
+
+function requireUsableSources(phase: ResearchPhase, sources: ReadSourceResult[]): void {
+  if (sources.length === 0) {
+    throw new Error(`No usable sources were collected during ${phase}; the run cannot produce an auditable report.`);
+  }
+}
+
 function sourceHost(url: string): string {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -89,6 +122,66 @@ function stripMarkdown(value: string): string {
     .replace(/[#>*_`[\]()-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function contextBlock(name: string, value: string): string {
+  const content = value.trim() || "(none)";
+  return `<${name}>\n${content}\n</${name}>`;
+}
+
+function summarizeBlackboardForContext(body: string, maxLength = 2_000): string {
+  const trimmed = body.trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  const parts = trimmed.split(/\n(?=##\s+)/);
+  const title = parts[0]?.startsWith("## ") ? "# Research Blackboard" : parts[0]?.trim() || "# Research Blackboard";
+  const sections = parts.filter((part) => part.startsWith("## "));
+  if (sections.length === 0) {
+    return `${title}\n\n## Blackboard Summary\n\n${compactText(trimmed, maxLength)}`;
+  }
+
+  const recentSections: string[] = [];
+  let recentLength = 0;
+  const recentBudget = Math.floor(maxLength * 0.65);
+  for (const section of [...sections].reverse()) {
+    const cleanSection = section.trim();
+    if (recentSections.length > 0 && recentLength + cleanSection.length > recentBudget) {
+      break;
+    }
+    recentSections.unshift(cleanSection);
+    recentLength += cleanSection.length;
+  }
+
+  const omittedSections = sections.slice(0, Math.max(0, sections.length - recentSections.length));
+  const omittedHeadings = omittedSections
+    .map((section) => section.match(/^##\s+(.+)$/m)?.[1]?.trim())
+    .filter((heading): heading is string => Boolean(heading));
+  const summary = [
+    title,
+    "## Earlier Blackboard Summary",
+    omittedHeadings.length > 0
+      ? `Older sections omitted from this role context: ${omittedHeadings.slice(-12).join("; ")}.`
+      : "Older free-form blackboard notes were omitted from this role context.",
+    "## Recent Blackboard Sections",
+    recentSections.join("\n\n"),
+  ].join("\n\n");
+
+  if (summary.length <= maxLength) {
+    return summary;
+  }
+
+  const recentText = recentSections.join("\n\n");
+  const summaryHeader = [
+    title,
+    "## Earlier Blackboard Summary",
+    omittedHeadings.length > 0
+      ? `Older sections omitted from this role context: ${omittedHeadings.slice(-8).join("; ")}.`
+      : "Older free-form blackboard notes were omitted from this role context.",
+    "## Recent Blackboard Sections",
+  ].join("\n\n");
+  return `${summaryHeader}\n\n${recentText.slice(Math.max(0, recentText.length - Math.max(400, maxLength - summaryHeader.length - 2)))}`;
 }
 
 function uniqueByUrl(results: SearchResult[]): SearchResult[] {
@@ -135,6 +228,54 @@ function memoryToContext(memory: MemoryBundle): string {
     .slice(0, 6)
     .map((doc) => `## ${doc.title}\n\n${compactText(doc.body, 1_000)}`);
   return sections.length > 0 ? sections.join("\n\n") : "No prior memory loaded.";
+}
+
+function asStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string");
+  }
+  return typeof value === "string" && value ? [value] : [];
+}
+
+function artifactRefsFromFrontmatter(frontmatter: Record<string, unknown>): string[] {
+  return [
+    ...asStringArray(frontmatter.sources),
+    ...asStringArray(frontmatter.source),
+    ...asStringArray(frontmatter.target),
+    ...asStringArray(frontmatter.question_id),
+    ...asStringArray(frontmatter.artifact_id),
+    ...asStringArray(frontmatter.opposes),
+  ];
+}
+
+function artifactTime(entry: ArtifactIndexEntry): number {
+  return Date.parse(entry.updatedAt ?? entry.createdAt ?? "") || 0;
+}
+
+function artifactsToContext(entries: ArtifactIndexEntry[]): string {
+  const sorted = [...entries]
+    .filter((entry) => entry.kind !== "blackboard" && entry.kind !== "user_input")
+    .sort((a, b) => artifactTime(b) - artifactTime(a) || b.path.localeCompare(a.path))
+  const selected: ArtifactIndexEntry[] = [];
+  const pushUnique = (entry: ArtifactIndexEntry) => {
+    if (!selected.some((existing) => existing.id === entry.id)) {
+      selected.push(entry);
+    }
+  };
+  sorted.filter((entry) => entry.kind === "question").slice(0, 8).forEach(pushUnique);
+  sorted.slice(0, 16).forEach(pushUnique);
+  if (selected.length === 0) {
+    return "No linked artifacts yet.";
+  }
+  return selected
+    .slice(0, 22)
+    .map((entry) => {
+      const tags = entry.tags.length > 0 ? ` tags=${entry.tags.join(",")}` : "";
+      const refs = artifactRefsFromFrontmatter(entry.frontmatter);
+      const refsText = refs.length > 0 ? ` refs=${[...new Set(refs)].join(",")}` : "";
+      return `- ${entry.id} [${entry.kind}] ${entry.title} (${entry.path})${tags}${refsText}`;
+    })
+    .join("\n");
 }
 
 function buildSystemPrompt(role: AgentRole): string {
@@ -301,15 +442,27 @@ export class ResearchController {
   }
 
   async getEvents(runId: string): Promise<ResearchEvent[]> {
+    await this.requireRun(runId);
     return this.options.store.readEvents(runId);
   }
 
   async listArtifacts(runId: string): Promise<ArtifactRef[]> {
+    await this.requireRun(runId);
     return this.options.store.listArtifacts(runId);
   }
 
   async readArtifact(runId: string, artifactPath: string) {
+    await this.requireRun(runId);
     return this.options.store.readArtifact(runId, artifactPath);
+  }
+
+  async readArtifactById(runId: string, artifactId: string) {
+    await this.requireRun(runId);
+    return this.options.store.readArtifactById(runId, artifactId);
+  }
+
+  async getMemory(domain?: string): Promise<MemoryBundle> {
+    return this.options.store.loadMemory(domain);
   }
 
   getLimits(): Record<keyof typeof DEFAULT_LIMITS, number> {
@@ -317,10 +470,20 @@ export class ResearchController {
   }
 
   async addFeedback(runId: string, feedback: FeedbackRequest): Promise<ArtifactRef> {
+    const run = await this.requireRun(runId);
     const target = await this.options.store.readArtifactById(runId, feedback.artifactId);
+    if (!target) {
+      throw new Error(`Artifact not found: ${feedback.artifactId}`);
+    }
     const artifact = await this.options.store.appendFeedback(runId, feedback);
+    const updatedTarget = await this.options.store.appendFeedbackToArtifact(runId, feedback, artifact);
     await this.options.store.appendSourceReputationFeedback({ runId, feedback, artifact: target });
+    await this.options.store.appendDomainTrustedSourceFeedback({ runId, domain: run.domain, feedback, artifact: target });
+    await this.options.store.appendUserFeedbackMemory({ runId, feedback, artifact: target });
     await this.emit({ type: "artifact.created", runId, artifact, at: nowIso() });
+    if (updatedTarget) {
+      await this.emit({ type: "artifact.updated", runId, artifact: updatedTarget, at: nowIso() });
+    }
     return artifact;
   }
 
@@ -329,6 +492,10 @@ export class ResearchController {
     await this.emit({ type: "run.created", runId: run.id, at: nowIso() });
     const abortController = new AbortController();
     const promise = this.executeRun(run, input, abortController.signal).catch(async (error: unknown) => {
+      if (abortController.signal.aborted || isAbortError(error)) {
+        await this.markRunCancelled(run.id);
+        return;
+      }
       await this.emit({
         type: "run.failed",
         runId: run.id,
@@ -337,7 +504,7 @@ export class ResearchController {
       });
       const latest = await this.options.store.readRun(run.id);
       if (latest) {
-        await this.options.store.updateRun({ ...latest, status: "failed" });
+        await this.updateRunStatus(latest, "failed");
       }
     });
     this.activeRuns.set(run.id, { run, input, abortController, promise });
@@ -353,9 +520,20 @@ export class ResearchController {
     if (this.activeRuns.has(runId)) {
       throw new Error(`Run is already active: ${runId}`);
     }
+    if (input.questionId) {
+      const question = await this.options.store.readArtifactById(runId, input.questionId);
+      if (!question || question.kind !== "question") {
+        throw new Error(`Question artifact not found: ${input.questionId}`);
+      }
+    }
+    const continuationInput = { ...input, domain: input.domain ?? run.domain };
     const abortController = new AbortController();
     const running = await this.updateRunStatus(run, "running");
-    const promise = this.executeContinuation(running, input, abortController.signal).catch(async (error: unknown) => {
+    const promise = this.executeContinuation(running, continuationInput, abortController.signal).catch(async (error: unknown) => {
+      if (abortController.signal.aborted || isAbortError(error)) {
+        await this.markRunCancelled(runId);
+        return;
+      }
       await this.emit({
         type: "run.failed",
         runId,
@@ -364,28 +542,44 @@ export class ResearchController {
       });
       const latest = await this.options.store.readRun(runId);
       if (latest) {
-        await this.options.store.updateRun({ ...latest, status: "failed" });
+        await this.updateRunStatus(latest, "failed");
       }
     });
-    this.activeRuns.set(runId, { run: running, input, abortController, promise });
+    this.activeRuns.set(runId, { run: running, input: continuationInput, abortController, promise });
     promise.finally(() => this.activeRuns.delete(runId)).catch(() => undefined);
     return running;
   }
 
-  cancelRun(runId: string): boolean {
+  async cancelRun(runId: string): Promise<boolean> {
+    const run = await this.options.store.readRun(runId);
+    if (!run) {
+      throw new Error(`Run not found: ${runId}`);
+    }
     const state = this.activeRuns.get(runId);
     if (!state) {
       return false;
     }
-    state.abortController.abort();
+    state.abortController.abort(new Error("Run cancelled by user"));
     return true;
   }
 
   private async emit(event: ResearchEvent): Promise<void> {
     await this.options.store.appendEvent(event.runId, event);
     for (const listener of this.listeners) {
-      listener(event);
+      try {
+        listener(event);
+      } catch {
+        // Event consumers must not be able to fail the research run.
+      }
     }
+  }
+
+  private async requireRun(runId: string): Promise<ResearchRun> {
+    const run = await this.options.store.readRun(runId);
+    if (!run) {
+      throw new Error(`Run not found: ${runId}`);
+    }
+    return run;
   }
 
   private async updateRunStatus(run: ResearchRun, status: ResearchRun["status"]): Promise<ResearchRun> {
@@ -394,21 +588,33 @@ export class ResearchController {
     return updated;
   }
 
+  private async markRunCancelled(runId: string): Promise<void> {
+    const latest = await this.options.store.readRun(runId);
+    if (!latest || latest.status === "cancelled") {
+      return;
+    }
+    await this.updateRunStatus(latest, "cancelled");
+  }
+
   private async executeRun(initialRun: ResearchRun, input: RunInput, signal: AbortSignal): Promise<void> {
     let run = await this.updateRunStatus(initialRun, "running");
     const memory = await this.options.store.loadMemory(input.domain);
     const searchTasks = await this.plan(run, input, memory, signal);
     const searchResults = await this.search(run, searchTasks, signal);
     const sourceResults = await this.readSources(run, searchResults, signal);
+    requireUsableSources("initial", sourceResults);
     const claims = await this.extractClaims(run, sourceResults, signal);
     await this.challengeClaims(run, claims, signal);
-    const insights = await this.mineInsights(run, input, sourceResults, claims, memory, signal);
     await this.auditClaims(run, claims, sourceResults, signal);
-    await this.writeContradictionMatrix(run, sourceResults, claims, "initial");
-    await this.writeQualityAudit(run, sourceResults, claims, "initial");
-    await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "initial", insights });
-    const report = await this.writeReport(run, input, sourceResults, claims, insights, memory, signal);
-    await this.writeMemoryUpdate(run, sourceResults, claims, {
+    const autoDeepDive = await this.runAutoDeepDive(run, input, sourceResults, claims, signal);
+    const allSources = [...sourceResults, ...autoDeepDive.sources];
+    const allClaims = [...claims, ...autoDeepDive.claims];
+    const insights = await this.mineInsights(run, input, allSources, allClaims, memory, signal);
+    await this.writeContradictionMatrix(run, allSources, allClaims, "initial");
+    await this.writeQualityAudit(run, allSources, allClaims, "initial");
+    await this.writeEvidenceLedger(run, allSources, allClaims, { phase: "initial", insights });
+    const report = await this.writeReport(run, input, allSources, allClaims, insights, memory, signal, autoDeepDive);
+    await this.writeMemoryUpdate(run, allSources, allClaims, {
       phase: "initial",
       domain: input.domain,
       report,
@@ -435,9 +641,11 @@ export class ResearchController {
     const providerNames = this.options.providers.searchProviders.map((provider) => provider.name);
     const cleanFocus = compactText(stripMarkdown(focus), 600);
     const maxSearchTasks = input.maxSearchTasks ?? 3;
+    const followupIndex = artifacts.filter((artifact) => artifact.id.startsWith("deep-dive-")).length + 1;
+    const followupPrefix = `followup-${String(followupIndex).padStart(3, "0")}`;
     const tasks: SearchTask[] = [
       {
-        id: "followup-search-1",
+        id: `${followupPrefix}-search-1`,
         angle: "independent corroboration for challenged claim",
         query: `${run.query} ${cleanFocus} independent corroboration primary evidence`,
         priority: 0.95,
@@ -446,7 +654,7 @@ export class ResearchController {
           .filter((name) => name === "exa" || name === "tavily" || name === "mock"),
       },
       {
-        id: "followup-search-2",
+        id: `${followupPrefix}-search-2`,
         angle: "counter evidence and contradiction search",
         query: `${run.query} ${cleanFocus} contradiction counterexample risk`,
         priority: 0.85,
@@ -455,7 +663,7 @@ export class ResearchController {
           .filter((name) => name === "exa" || name === "tavily" || name === "mock"),
       },
       {
-        id: "followup-search-3",
+        id: `${followupPrefix}-search-3`,
         angle: "weak signal and novel insight search",
         query: `${run.query} ${cleanFocus} weak signal adoption evidence insight`,
         priority: 0.75,
@@ -465,7 +673,7 @@ export class ResearchController {
       },
     ].slice(0, maxSearchTasks);
 
-    const critiqueId = `deep-dive-${String(artifacts.filter((artifact) => artifact.kind === "critique").length + 1).padStart(3, "0")}`;
+    const critiqueId = `deep-dive-${String(followupIndex).padStart(3, "0")}`;
     const critique = await this.options.store.writeArtifact({
       runId: run.id,
       kind: "critique",
@@ -500,13 +708,14 @@ export class ResearchController {
 
     const searchResults = await this.search(run, tasks, signal);
     const sourceResults = await this.readSources(run, searchResults.slice(0, 8), signal, { startIndex: sourceStartIndex });
+    requireUsableSources("continuation", sourceResults);
     const claims = await this.extractClaims(run, sourceResults, signal, { startIndex: claimStartIndex });
     await this.challengeClaims(run, claims, signal, { startIndex: questionStartIndex });
     await this.auditClaims(run, claims, sourceResults, signal, { startIndex: auditStartIndex });
     await this.writeContradictionMatrix(run, sourceResults, claims, "continuation");
     await this.writeQualityAudit(run, sourceResults, claims, "continuation");
     await this.writeEvidenceLedger(run, sourceResults, claims, { phase: "continuation" });
-    const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, signal);
+    const report = await this.writeContinuationReport(run, cleanFocus, sourceResults, claims, memory, signal);
     await this.writeMemoryUpdate(run, sourceResults, claims, {
       phase: "continuation",
       domain: input.domain,
@@ -515,6 +724,174 @@ export class ResearchController {
     });
     const finished = await this.updateRunStatus(run, "finished");
     await this.emit({ type: "continuation.finished", runId: finished.id, reportPath: report.path, at: nowIso() });
+  }
+
+  private searchProviderNames(): SearchTask["providers"] {
+    return this.options.providers.searchProviders
+      .map((provider) => provider.name)
+      .filter((name): name is "exa" | "tavily" | "mock" => name === "exa" || name === "tavily" || name === "mock");
+  }
+
+  private async selectAutoDeepDiveQuestion(
+    run: ResearchRun,
+    claims: ClaimArtifactResult[],
+  ): Promise<ArtifactDocument | undefined> {
+    const artifacts = (await this.options.store.listArtifacts(run.id)).filter((artifact) => artifact.kind === "question");
+    const docs = (
+      await Promise.all(artifacts.map((artifact) => this.options.store.readArtifact(run.id, artifact.path)))
+    ).filter((doc): doc is ArtifactDocument => Boolean(doc));
+    const claimById = new Map(claims.map(({ claim }) => [claim.id, claim]));
+    const severityScore = (value: unknown) => {
+      if (value === "high") {
+        return 100;
+      }
+      if (value === "medium") {
+        return 60;
+      }
+      if (value === "low") {
+        return 20;
+      }
+      return 0;
+    };
+    return docs
+      .map((doc) => {
+        const target = typeof doc.frontmatter.target === "string" ? doc.frontmatter.target : undefined;
+        const claim = target ? claimById.get(target) : undefined;
+        return {
+          doc,
+          score: severityScore(doc.frontmatter.severity) + (claim ? 1 - claim.confidence : 0),
+        };
+      })
+      .sort((a, b) => b.score - a.score)[0]?.doc;
+  }
+
+  private async runAutoDeepDive(
+    run: ResearchRun,
+    input: RunInput,
+    _sources: ReadSourceResult[],
+    claims: ClaimArtifactResult[],
+    signal: AbortSignal,
+  ): Promise<AutoDeepDiveResult> {
+    signal.throwIfAborted();
+    const question = await this.selectAutoDeepDiveQuestion(run, claims);
+    if (!question) {
+      await this.options.store.appendBlackboard(run.id, "Auto Deep Dive", "Skipped: no generated question was available.");
+      return { sources: [], claims: [] };
+    }
+
+    const providerNames = this.searchProviderNames();
+    const existingBeforeCritique = await this.options.store.listArtifacts(run.id);
+    const critiqueIndex = existingBeforeCritique.filter((artifact) => artifact.id.startsWith("auto-deep-dive")).length + 1;
+    const taskPrefix = `auto-deep-dive-${String(critiqueIndex).padStart(3, "0")}`;
+    const cleanFocus = compactText(stripMarkdown(question.body), 650);
+    const targetClaimId = typeof question.frontmatter.target === "string" ? question.frontmatter.target : undefined;
+    const targetClaim = targetClaimId ? claims.find(({ claim }) => claim.id === targetClaimId)?.claim : undefined;
+    const targetText = compactText(targetClaim?.text ?? cleanFocus, 500);
+    const tasks: SearchTask[] = [
+      {
+        id: `${taskPrefix}-search-1`,
+        angle: "independent corroboration for strongest challenge",
+        query: `${input.query} ${targetText} independent corroboration primary evidence`,
+        priority: 0.96,
+        providers: providerNames,
+      },
+      {
+        id: `${taskPrefix}-search-2`,
+        angle: "counter evidence and limitation search",
+        query: `${input.query} ${targetText} contradiction counterexample limitation risk`,
+        priority: 0.9,
+        providers: providerNames,
+      },
+    ];
+
+    await this.emit({
+      type: "deep_dive.started",
+      runId: run.id,
+      questionId: question.id,
+      targetClaimId,
+      prompt: cleanFocus,
+      at: nowIso(),
+    });
+
+    const critiqueId = `auto-deep-dive-${String(critiqueIndex).padStart(3, "0")}`;
+    const critique = await this.options.store.writeArtifact({
+      runId: run.id,
+      kind: "critique",
+      id: critiqueId,
+      title: "Auto Deep Dive Request",
+      collection: "critiques",
+      frontmatter: {
+        id: critiqueId,
+        type: "critique",
+        critique_kind: "auto_deep_dive",
+        target: targetClaimId,
+        question_id: question.id,
+        search_task_count: tasks.length,
+        tags: ["auto-deep-dive", "question-driven"],
+      },
+      body: [
+        "# Auto Deep Dive Request",
+        "",
+        "## Trigger Question",
+        "",
+        cleanFocus,
+        "",
+        "## Target Claim",
+        "",
+        targetClaim ? `${targetClaim.id}: ${targetClaim.text}` : "No target claim found.",
+        "",
+        "## Search Tasks",
+        "",
+        ...tasks.map((task) => `- **${task.id}** (${task.angle}): ${task.query}`),
+        "",
+        "## Rationale",
+        "",
+        "The system selected the highest-risk generated question and launched a bounded corroboration/counter-evidence pass before final synthesis.",
+      ].join("\n"),
+    });
+    await this.emit({ type: "artifact.created", runId: run.id, artifact: critique, at: nowIso() });
+    await this.options.store.appendBlackboard(
+      run.id,
+      "Auto Deep Dive",
+      `Started ${critiqueId} from ${question.id}${targetClaimId ? ` targeting ${targetClaimId}` : ""}.`,
+    );
+
+    const existing = await this.options.store.listArtifacts(run.id);
+    const sourceStartIndex = existing.filter((artifact) => artifact.kind === "source").length;
+    const claimStartIndex = existing.filter((artifact) => artifact.kind === "claim").length;
+    const questionStartIndex = existing.filter((artifact) => artifact.kind === "question").length;
+    const auditStartIndex = existing.filter((artifact) => artifact.kind === "audit").length;
+
+    const searchResults = await this.search(run, tasks, signal);
+    const sourceResults = await this.readSources(run, searchResults.slice(0, 6), signal, { startIndex: sourceStartIndex });
+    const deepDiveClaims = await this.extractClaims(run, sourceResults, signal, { startIndex: claimStartIndex });
+    await this.challengeClaims(run, deepDiveClaims, signal, { startIndex: questionStartIndex });
+    await this.auditClaims(run, deepDiveClaims, sourceResults, signal, { startIndex: auditStartIndex });
+    await this.writeContradictionMatrix(run, sourceResults, deepDiveClaims, "auto_deep_dive");
+    await this.writeQualityAudit(run, sourceResults, deepDiveClaims, "auto_deep_dive");
+    await this.writeEvidenceLedger(run, sourceResults, deepDiveClaims, { phase: "auto_deep_dive" });
+
+    await this.emit({
+      type: "deep_dive.finished",
+      runId: run.id,
+      questionId: question.id,
+      critiqueId,
+      sourceCount: sourceResults.length,
+      claimCount: deepDiveClaims.length,
+      at: nowIso(),
+    });
+    await this.options.store.appendBlackboard(
+      run.id,
+      "Auto Deep Dive Complete",
+      `Finished ${critiqueId}: ${sourceResults.length} sources, ${deepDiveClaims.length} claims.`,
+    );
+
+    return {
+      questionId: question.id,
+      critique,
+      sources: sourceResults,
+      claims: deepDiveClaims,
+    };
   }
 
   private async runRole(
@@ -526,6 +903,11 @@ export class ResearchController {
     signal: AbortSignal,
   ): Promise<string> {
     const taskId = makeTaskId(role);
+    const startedAt = Date.now();
+    const contextWithTask = [
+      context,
+      contextBlock("task", [`Role: ${roleLabel(role)}`, `Label: ${label}`, "", userPrompt].join("\n")),
+    ].join("\n\n");
     await this.emit({ type: "agent.started", runId: run.id, agent: role, taskId, label, at: nowIso() });
     const result = await this.roleRunner.run(
       {
@@ -534,7 +916,7 @@ export class ResearchController {
         label,
         systemPrompt: buildSystemPrompt(role),
         userPrompt,
-        context,
+        context: contextWithTask,
       },
       signal,
     );
@@ -548,8 +930,51 @@ export class ResearchController {
         at: nowIso(),
       });
     }
-    await this.emit({ type: "agent.finished", runId: run.id, agent: role, taskId, at: nowIso() });
+    await this.emit({
+      type: "agent.finished",
+      runId: run.id,
+      agent: role,
+      taskId,
+      usedPi: result.usedPi,
+      model: result.model,
+      durationMs: elapsedMs(startedAt),
+      at: nowIso(),
+    });
     return result.text;
+  }
+
+  private async buildRoleContext(
+    run: ResearchRun,
+    memory: MemoryBundle,
+    extraBlocks: Record<string, string> = {},
+  ): Promise<string> {
+    const [blackboard, events, artifactIndex] = await Promise.all([
+      this.options.store.readArtifact(run.id, "02_blackboard.md").catch(() => undefined),
+      this.options.store.readEvents(run.id).catch(() => []),
+      this.options.store.buildArtifactIndex(run.id).catch(() => undefined),
+    ]);
+    const runState = [
+      `Run: ${run.id}`,
+      `Status: ${run.status}`,
+      run.domain ? `Domain: ${run.domain}` : undefined,
+      `Updated: ${run.updatedAt}`,
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
+    const recentEvents = events
+      .slice(-12)
+      .map((event) => `- ${event.at} ${event.type}: ${compactText(JSON.stringify(event), 260)}`)
+      .join("\n");
+
+    return [
+      contextBlock("root_user_input", run.query),
+      contextBlock("current_run_state", runState),
+      contextBlock("relevant_memory", memoryToContext(memory)),
+      contextBlock("blackboard", summarizeBlackboardForContext(blackboard?.body ?? "")),
+      contextBlock("artifact_inventory", artifactsToContext(artifactIndex?.all ?? [])),
+      contextBlock("recent_events", recentEvents),
+      ...Object.entries(extraBlocks).map(([name, value]) => contextBlock(name, value)),
+    ].join("\n\n");
   }
 
   private async plan(
@@ -561,7 +986,9 @@ export class ResearchController {
     signal.throwIfAborted();
     const providerNames = this.options.providers.searchProviders.map((provider) => provider.name);
     const tasks = buildSearchTasks(input, providerNames);
-    const context = `<root_user_input>\n${input.query}\n</root_user_input>\n\n<relevant_memory>\n${memoryToContext(memory)}\n</relevant_memory>`;
+    const context = await this.buildRoleContext(run, memory, {
+      proposed_search_tasks: tasks.map((task) => `- ${task.id}: ${task.angle} -> ${task.query}`).join("\n"),
+    });
     const modelText = await this.runRole(
       run,
       "planner",
@@ -569,6 +996,17 @@ export class ResearchController {
       `Create a research plan and assess risk areas. Proposed tasks:\n${tasks
         .map((task) => `- ${task.id}: ${task.angle} -> ${task.query}`)
         .join("\n")}`,
+      context,
+      signal,
+    );
+    const searchStrategyText = await this.runRole(
+      run,
+      "search-strategist",
+      "Stress-test search strategy",
+      [
+        "Review the proposed search tasks for independence, provider fit, and missing evidence classes.",
+        "Identify which tasks should surface primary evidence, counter-evidence, weak signals, and source-quality risks.",
+      ].join("\n"),
       context,
       signal,
     );
@@ -586,6 +1024,10 @@ export class ResearchController {
       "## Planner Notes",
       "",
       modelText,
+      "",
+      "## Search Strategy Notes",
+      "",
+      searchStrategyText,
     ].join("\n");
     const artifact = await this.options.store.writeArtifact({
       runId: run.id,
@@ -615,6 +1057,7 @@ export class ResearchController {
       this.limits.maxSearchAgents,
       async ({ task, provider }) => {
         const taskId = `${task.id}-${provider.name}`;
+        const startedAt = Date.now();
         await this.emit({ type: "tool.started", runId: run.id, tool: `${provider.name}.search`, taskId, at: nowIso() });
         try {
           const results = await provider.search({ task, maxResults: 4 }, signal);
@@ -624,6 +1067,7 @@ export class ResearchController {
             tool: `${provider.name}.search`,
             taskId,
             ok: true,
+            durationMs: elapsedMs(startedAt),
             at: nowIso(),
           });
           return results;
@@ -635,6 +1079,7 @@ export class ResearchController {
             taskId,
             ok: false,
             error: compactError(error),
+            durationMs: elapsedMs(startedAt),
             at: nowIso(),
           });
           return [];
@@ -657,10 +1102,13 @@ export class ResearchController {
       results,
       this.limits.maxReaderAgents,
       async (result, index) => {
-        const taskId = `read-${index + 1}`;
+        const taskNumber = (options.startIndex ?? 0) + index + 1;
+        const taskId = `read-${taskNumber}`;
+        const agentStartedAt = Date.now();
         await this.emit({ type: "agent.started", runId: run.id, agent: "source-reader", taskId, label: result.title, at: nowIso() });
         let content = result.content || result.snippet;
         if (!result.content || result.content.length < 300) {
+          const fetchStartedAt = Date.now();
           await this.emit({ type: "tool.started", runId: run.id, tool: `${this.options.providers.fetchProvider.name}.fetch`, taskId, at: nowIso() });
           try {
             const fetched = await this.options.providers.fetchProvider.fetch(result.url, signal);
@@ -671,6 +1119,7 @@ export class ResearchController {
               tool: `${this.options.providers.fetchProvider.name}.fetch`,
               taskId,
               ok: true,
+              durationMs: elapsedMs(fetchStartedAt),
               at: nowIso(),
             });
           } catch (error) {
@@ -681,6 +1130,7 @@ export class ResearchController {
               taskId,
               ok: false,
               error: compactError(error),
+              durationMs: elapsedMs(fetchStartedAt),
               at: nowIso(),
             });
           }
@@ -689,6 +1139,7 @@ export class ResearchController {
         const reputation = await this.options.store.getSourceReputation({
           url: result.url,
           title: result.title,
+          domain: run.domain,
         });
         const credibility = scoreSourceCredibility({
           sourceKind,
@@ -699,7 +1150,7 @@ export class ResearchController {
           reputationAdjustment: reputation.adjustment,
         });
         const source: SourceRecord = {
-          id: `source-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`,
+          id: `source-${String(taskNumber).padStart(3, "0")}`,
           title: result.title,
           url: result.url,
           provider: result.provider,
@@ -732,7 +1183,14 @@ export class ResearchController {
           body: sourceToMarkdown(source),
         });
         await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
-        await this.emit({ type: "agent.finished", runId: run.id, agent: "source-reader", taskId, at: nowIso() });
+        await this.emit({
+          type: "agent.finished",
+          runId: run.id,
+          agent: "source-reader",
+          taskId,
+          durationMs: elapsedMs(agentStartedAt),
+          at: nowIso(),
+        });
         return { source, artifact };
       },
     );
@@ -748,6 +1206,7 @@ export class ResearchController {
   ): Promise<Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>> {
     signal.throwIfAborted();
     const taskId = makeTaskId("claims");
+    const startedAt = Date.now();
     await this.emit({ type: "agent.started", runId: run.id, agent: "claim-extractor", taskId, label: "Extract claims", at: nowIso() });
     const claims = sources.slice(0, 8).map(({ source }, index) => makeClaimFromSource(source, (options.startIndex ?? 0) + index));
     const deduped = claims.filter((claim, index, all) => all.findIndex((other) => other.text === claim.text) === index);
@@ -776,7 +1235,14 @@ export class ResearchController {
         return { claim, source, artifact };
       }),
     );
-    await this.emit({ type: "agent.finished", runId: run.id, agent: "claim-extractor", taskId, at: nowIso() });
+    await this.emit({
+      type: "agent.finished",
+      runId: run.id,
+      agent: "claim-extractor",
+      taskId,
+      durationMs: elapsedMs(startedAt),
+      at: nowIso(),
+    });
     await this.options.store.appendBlackboard(run.id, "Claims", `Extracted ${artifacts.length} distinct claims.`);
     return artifacts;
   }
@@ -793,6 +1259,7 @@ export class ResearchController {
       async ({ claim, source }, index) => {
         signal.throwIfAborted();
         const taskId = `skeptic-${claim.id}`;
+        const startedAt = Date.now();
         await this.emit({ type: "agent.started", runId: run.id, agent: "skeptic", taskId, label: `Challenge ${claim.id}`, at: nowIso() });
         const severity = claim.confidence < 0.7 ? "high" : "medium";
         const questionId = `question-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`;
@@ -827,7 +1294,14 @@ export class ResearchController {
         });
         await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
         await this.emit({ type: "claim.challenged", runId: run.id, claimId: claim.id, questionId, severity, at: nowIso() });
-        await this.emit({ type: "agent.finished", runId: run.id, agent: "skeptic", taskId, at: nowIso() });
+        await this.emit({
+          type: "agent.finished",
+          runId: run.id,
+          agent: "skeptic",
+          taskId,
+          durationMs: elapsedMs(startedAt),
+          at: nowIso(),
+        });
       },
     );
     await this.options.store.appendBlackboard(run.id, "Skeptic Loop", `Challenged ${claims.length} claims for independence and missing evidence.`);
@@ -841,9 +1315,13 @@ export class ResearchController {
     memory: MemoryBundle,
     signal: AbortSignal,
   ): Promise<ArtifactRef[]> {
-    const context = `<root_user_input>\n${input.query}\n</root_user_input>\n\n<claims>\n${claims
-      .map(({ claim }) => `- ${claim.id}: ${claim.text}`)
-      .join("\n")}\n</claims>\n\n<relevant_memory>\n${memoryToContext(memory)}\n</relevant_memory>`;
+    const context = await this.buildRoleContext(run, memory, {
+      claims: claims.map(({ claim }) => `- ${claim.id}: ${claim.text}`).join("\n"),
+      sources: sources
+        .slice(0, 8)
+        .map(({ source }) => `- ${source.id} (${source.sourceKind}, ${source.credibility}): ${source.title}`)
+        .join("\n"),
+    });
     const modelText = await this.runRole(
       run,
       "insight-miner",
@@ -906,19 +1384,34 @@ export class ResearchController {
   private async auditClaims(
     run: ResearchRun,
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
-    _sources: ReadSourceResult[],
+    sources: ReadSourceResult[],
     signal: AbortSignal,
     options: { startIndex?: number } = {},
   ): Promise<void> {
+    const artifactIndex = await this.options.store.buildArtifactIndex(run.id);
+    const questionEntries = artifactIndex.byKind.get("question") ?? [];
+    const sourceRecords = sources.map(({ source }) => source);
     await mapWithConcurrency(
       claims,
       this.limits.maxCritiqueAgents,
       async ({ claim, source }, index) => {
         signal.throwIfAborted();
         const taskId = `audit-${claim.id}`;
+        const startedAt = Date.now();
         await this.emit({ type: "agent.started", runId: run.id, agent: "citation-auditor", taskId, label: `Audit ${claim.id}`, at: nowIso() });
         const support = claim.confidence >= 0.75 ? "supported" : claim.confidence >= 0.55 ? "partially_supported" : "weak";
         const auditId = `audit-${String((options.startIndex ?? 0) + index + 1).padStart(3, "0")}`;
+        const relatedQuestions = questionEntries.filter((entry) => entry.frontmatter.target === claim.id);
+        const candidateOpposingSources = sourceRecords
+          .filter((candidate) => !claim.sources.includes(candidate.id))
+          .filter((candidate) => {
+            const text = `${candidate.title} ${candidate.summary} ${candidate.keyQuotes.join(" ")}`.toLowerCase();
+            return /risk|concern|counter|contradict|uneven|but |however|still|shadow|warning|limited|weak/.test(text);
+          });
+        const opposingSources = (candidateOpposingSources.length > 0
+          ? candidateOpposingSources
+          : sourceRecords.filter((candidate) => !claim.sources.includes(candidate.id))
+        ).slice(0, 3);
         const body = [
           "# Citation Audit",
           "",
@@ -931,6 +1424,20 @@ export class ResearchController {
           "## Evidence Check",
           "",
           source.keyQuotes.map((quote) => `> ${quote}`).join("\n\n"),
+          "",
+          "## Open Questions",
+          "",
+          relatedQuestions.length > 0
+            ? relatedQuestions.map((question) => `- ${question.id}: ${question.title}`).join("\n")
+            : "No open question artifact targets this claim yet.",
+          "",
+          "## Opposing / Qualifying Evidence Candidates",
+          "",
+          opposingSources.length > 0
+            ? opposingSources
+                .map((candidate) => `- ${candidate.id} (${candidate.sourceKind}, credibility ${candidate.credibility}): ${candidate.title}`)
+                .join("\n")
+            : "No separate opposing or qualifying source candidate was available in this phase.",
           "",
           "## Auditor Note",
           "",
@@ -950,11 +1457,20 @@ export class ResearchController {
             target: claim.id,
             status: support,
             source: source.id,
+            questions: relatedQuestions.map((question) => question.id),
+            opposing_sources: opposingSources.map((candidate) => candidate.id),
           },
           body,
         });
         await this.emit({ type: "artifact.created", runId: run.id, artifact, at: nowIso() });
-        await this.emit({ type: "agent.finished", runId: run.id, agent: "citation-auditor", taskId, at: nowIso() });
+        await this.emit({
+          type: "agent.finished",
+          runId: run.id,
+          agent: "citation-auditor",
+          taskId,
+          durationMs: elapsedMs(startedAt),
+          at: nowIso(),
+        });
       },
     );
     await this.options.store.appendBlackboard(run.id, "Audit", `Audited ${claims.length} claims for citation support.`);
@@ -964,7 +1480,7 @@ export class ResearchController {
     run: ResearchRun,
     sources: ReadSourceResult[],
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
-    options: { phase: "initial" | "continuation"; insights?: ArtifactRef[] },
+    options: { phase: ResearchPhase; insights?: ArtifactRef[] },
   ): Promise<ArtifactRef> {
     const sourceRecords = sources.map(({ source }) => source);
     const sourceById = new Map(sourceRecords.map((source) => [source.id, source]));
@@ -1116,7 +1632,7 @@ export class ResearchController {
     run: ResearchRun,
     sources: ReadSourceResult[],
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
-    phase: "initial" | "continuation",
+    phase: ResearchPhase,
   ): Promise<ArtifactRef> {
     const sourceRecords = sources.map(({ source }) => source);
     const sourceById = new Map(sourceRecords.map((source) => [source.id, source]));
@@ -1221,7 +1737,7 @@ export class ResearchController {
     run: ResearchRun,
     sources: ReadSourceResult[],
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
-    options: { phase: "initial" | "continuation"; domain?: string; focus?: string; report: ArtifactRef },
+    options: { phase: ResearchPhase; domain?: string; focus?: string; report: ArtifactRef },
   ): Promise<ArtifactRef> {
     const sourceRecords = sources.map(({ source }) => source);
     const sourceKinds = [...new Set(sourceRecords.map((source) => source.sourceKind))];
@@ -1321,7 +1837,7 @@ export class ResearchController {
     run: ResearchRun,
     sources: ReadSourceResult[],
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
-    phase: "initial" | "continuation",
+    phase: ResearchPhase,
   ): Promise<ArtifactRef> {
     const sourceRecords = sources.map(({ source }) => source);
     const averageCredibility =
@@ -1436,16 +1952,20 @@ export class ResearchController {
     focus: string,
     sources: ReadSourceResult[],
     claims: Array<{ claim: ClaimRecord; source: SourceRecord; artifact: ArtifactRef }>,
+    memory: MemoryBundle,
     signal: AbortSignal,
   ): Promise<ArtifactRef> {
     const existingReports = (await this.options.store.listArtifacts(run.id)).filter((artifact) => artifact.kind === "report");
     const reportIndex = existingReports.length + 1;
     const reportId = `followup-report-${String(reportIndex).padStart(3, "0")}`;
-    const context = `<followup_focus>\n${focus}\n</followup_focus>\n\n<new_claims>\n${claims
-      .map(({ claim }) => `- ${claim.id} (${claim.status}, ${claim.confidence}): ${claim.text}`)
-      .join("\n")}\n</new_claims>\n\n<new_sources>\n${sources
-      .map(({ source }) => `- ${source.id} (${source.sourceKind}, ${source.credibility}): ${source.title}`)
-      .join("\n")}\n</new_sources>`;
+    const context = await this.buildRoleContext(run, memory, {
+      followup_focus: focus,
+      new_claims: claims.map(({ claim }) => `- ${claim.id} (${claim.status}, ${claim.confidence}): ${claim.text}`).join("\n"),
+      new_sources: sources
+        .slice(0, 8)
+        .map(({ source }) => `- ${source.id} (${source.sourceKind}, ${source.credibility}): ${source.title}`)
+        .join("\n"),
+    });
     const modelText = await this.runRole(
       run,
       "report-writer",
@@ -1517,13 +2037,18 @@ export class ResearchController {
     insights: ArtifactRef[],
     memory: MemoryBundle,
     signal: AbortSignal,
+    autoDeepDive?: AutoDeepDiveResult,
   ): Promise<ArtifactRef> {
-    const context = `<root_user_input>\n${input.query}\n</root_user_input>\n\n<claims>\n${claims
-      .map(({ claim }) => `- ${claim.id} (${claim.status}, ${claim.confidence}): ${claim.text}`)
-      .join("\n")}\n</claims>\n\n<sources>\n${sources
-      .slice(0, 8)
-      .map(({ source }) => `- ${source.id} (${source.sourceKind}, ${source.credibility}): ${source.title}`)
-      .join("\n")}\n</sources>\n\n<memory>\n${memoryToContext(memory)}\n</memory>`;
+    const context = await this.buildRoleContext(run, memory, {
+      claims: claims.map(({ claim }) => `- ${claim.id} (${claim.status}, ${claim.confidence}): ${claim.text}`).join("\n"),
+      sources: sources
+        .slice(0, 8)
+        .map(({ source }) => `- ${source.id} (${source.sourceKind}, ${source.credibility}): ${source.title}`)
+        .join("\n"),
+      auto_deep_dive: autoDeepDive?.questionId
+        ? `Question: ${autoDeepDive.questionId}\nSources: ${autoDeepDive.sources.length}\nClaims: ${autoDeepDive.claims.length}`
+        : "",
+    });
     const modelText = await this.runRole(
       run,
       "report-writer",
@@ -1544,6 +2069,18 @@ export class ResearchController {
       .slice(0, 10)
       .map(({ source }) => `- **${source.id}** [${source.sourceKind}, ${source.credibility}] ${source.title} - ${source.url}`)
       .join("\n");
+    const deepDiveClaimLines = autoDeepDive?.claims
+      .map(
+        ({ claim }) =>
+          `- **${claim.id}** (${claim.status}, confidence ${claim.confidence}): ${claim.text} Sources: ${claim.sources
+            .map((sourceId) => `\`${sourceId}\``)
+            .join(", ")}`,
+      )
+      .join("\n");
+    const deepDiveSourceLines = autoDeepDive?.sources
+      .slice(0, 6)
+      .map(({ source }) => `- **${source.id}** [${source.sourceKind}, ${source.credibility}] ${source.title}`)
+      .join("\n");
     const body = [
       "# Final Report",
       "",
@@ -1560,6 +2097,20 @@ export class ResearchController {
       insights.length > 0
         ? "The main strategic tension is bottom-up speed versus top-down trust. A product that exposes audit trails, claim challenges, and source reputation can turn that tension into a buying wedge."
         : "No insight artifact was created.",
+      "",
+      "## Auto Deep Dive",
+      "",
+      autoDeepDive?.critique
+        ? `The system automatically deepened \`${autoDeepDive.questionId}\` through \`${autoDeepDive.critique.id}\` before final synthesis.`
+        : "No automatic deep dive was triggered.",
+      "",
+      "### Deep Dive Claims",
+      "",
+      deepDiveClaimLines || "No deep-dive claims were extracted.",
+      "",
+      "### Deep Dive Sources",
+      "",
+      deepDiveSourceLines || "No deep-dive sources were added.",
       "",
       "## Source Trail",
       "",
@@ -1587,7 +2138,11 @@ export class ResearchController {
         claim_count: claims.length,
         source_count: sources.length,
         insight_count: insights.length,
-        tags: ["final-report", slugFragment(input.query)],
+        auto_deep_dive: Boolean(autoDeepDive?.critique),
+        auto_deep_dive_question: autoDeepDive?.questionId,
+        auto_deep_dive_claim_count: autoDeepDive?.claims.length ?? 0,
+        auto_deep_dive_source_count: autoDeepDive?.sources.length ?? 0,
+        tags: ["final-report", slugFragment(input.query), ...(autoDeepDive?.critique ? ["auto-deep-dive"] : [])],
       },
       body,
     });

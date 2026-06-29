@@ -1,6 +1,6 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import type { AgentRole } from "@fdr/schemas";
+import { parseLlmModelConfig, type AgentRole } from "@fdr/schemas";
 
 export interface RoleTurnInput {
   role: AgentRole;
@@ -29,18 +29,8 @@ export interface HybridRoleRunnerOptions {
 }
 
 function readEnvModel(): { provider?: string; model?: string } {
-  const explicit = process.env.FDR_LLM_MODEL;
-  if (!explicit) {
-    return {};
-  }
-  if (explicit.includes("/")) {
-    const [provider, ...rest] = explicit.split("/");
-    return { provider, model: rest.join("/") };
-  }
-  return {
-    provider: process.env.FDR_LLM_PROVIDER,
-    model: explicit,
-  };
+  const config = parseLlmModelConfig(process.env);
+  return { provider: config.provider, model: config.model };
 }
 
 function extractAssistantText(message: unknown): string {
@@ -70,7 +60,8 @@ function extractAssistantText(message: unknown): string {
 }
 
 class FallbackRoleRunner implements RoleRunner {
-  async run(input: RoleTurnInput, _signal?: AbortSignal): Promise<RoleTurnResult> {
+  async run(input: RoleTurnInput, signal?: AbortSignal): Promise<RoleTurnResult> {
+    signal?.throwIfAborted();
     return {
       usedPi: false,
       text: [

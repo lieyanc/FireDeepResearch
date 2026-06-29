@@ -13,6 +13,35 @@ export const AgentRoleSchema = z.enum([
 
 export type AgentRole = z.infer<typeof AgentRoleSchema>;
 
+export type LlmModelConfigSource = "none" | "FDR_LLM_PROVIDER+FDR_LLM_MODEL" | "FDR_LLM_MODEL" | "missing-provider" | "invalid";
+
+export interface LlmModelConfig {
+  provider?: string;
+  model?: string;
+  source: LlmModelConfigSource;
+}
+
+export function parseLlmModelConfig(env: Record<string, string | undefined>): LlmModelConfig {
+  const explicitModel = env.FDR_LLM_MODEL?.trim();
+  if (!explicitModel) {
+    return { source: "none" };
+  }
+
+  const explicitProvider = env.FDR_LLM_PROVIDER?.trim();
+  if (explicitProvider) {
+    return { provider: explicitProvider, model: explicitModel, source: "FDR_LLM_PROVIDER+FDR_LLM_MODEL" };
+  }
+
+  if (explicitModel.includes("/")) {
+    const [providerPart, ...modelParts] = explicitModel.split("/");
+    const provider = providerPart.trim();
+    const model = modelParts.join("/").trim();
+    return provider && model ? { provider, model, source: "FDR_LLM_MODEL" } : { source: "invalid" };
+  }
+
+  return { model: explicitModel, source: "missing-provider" };
+}
+
 export const ArtifactKindSchema = z.enum([
   "user_input",
   "plan",
@@ -80,6 +109,7 @@ export type ClaimStatus = z.infer<typeof ClaimStatusSchema>;
 export const ResearchRunSchema = z.object({
   id: z.string(),
   query: z.string(),
+  domain: z.string().optional(),
   status: RunStatusSchema,
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -171,6 +201,9 @@ export const ResearchEventSchema = z.discriminatedUnion("type", [
     runId: z.string(),
     agent: AgentRoleSchema,
     taskId: z.string(),
+    usedPi: z.boolean().optional(),
+    model: z.string().optional(),
+    durationMs: z.number().int().min(0).optional(),
     at: z.string(),
   }),
   z.object({
@@ -195,10 +228,17 @@ export const ResearchEventSchema = z.discriminatedUnion("type", [
     taskId: z.string(),
     ok: z.boolean(),
     error: z.string().optional(),
+    durationMs: z.number().int().min(0).optional(),
     at: z.string(),
   }),
   z.object({
     type: z.literal("artifact.created"),
+    runId: z.string(),
+    artifact: ArtifactRefSchema,
+    at: z.string(),
+  }),
+  z.object({
+    type: z.literal("artifact.updated"),
     runId: z.string(),
     artifact: ArtifactRefSchema,
     at: z.string(),
@@ -216,6 +256,23 @@ export const ResearchEventSchema = z.discriminatedUnion("type", [
     runId: z.string(),
     insightId: z.string(),
     novelty: z.enum(["low", "medium", "high"]),
+    at: z.string(),
+  }),
+  z.object({
+    type: z.literal("deep_dive.started"),
+    runId: z.string(),
+    questionId: z.string(),
+    targetClaimId: z.string().optional(),
+    prompt: z.string(),
+    at: z.string(),
+  }),
+  z.object({
+    type: z.literal("deep_dive.finished"),
+    runId: z.string(),
+    questionId: z.string(),
+    critiqueId: z.string(),
+    sourceCount: z.number().int().min(0),
+    claimCount: z.number().int().min(0),
     at: z.string(),
   }),
   z.object({
@@ -247,27 +304,40 @@ export const ResearchEventSchema = z.discriminatedUnion("type", [
 
 export type ResearchEvent = z.infer<typeof ResearchEventSchema>;
 
+const optionalTrimmedString = (schema: z.ZodString) =>
+  z.preprocess((value) => (typeof value === "string" && value.trim() === "" ? undefined : value), schema.trim().optional());
+
+export const DomainSlugSchema = optionalTrimmedString(
+  z
+    .string()
+    .min(1)
+    .max(80)
+    .regex(/^[\p{L}\p{N}._ -]+$/u, "domain may only contain letters, numbers, spaces, dots, underscores, and hyphens"),
+);
+
+export const ArtifactIdInputSchema = z.string().trim().min(1).max(160).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+
 export const RunCreateRequestSchema = z.object({
-  query: z.string().min(3),
-  domain: z.string().optional(),
+  query: z.string().trim().min(3).max(4_000),
+  domain: DomainSlugSchema,
   maxSearchTasks: z.number().int().min(1).max(12).optional(),
 });
 
 export type RunCreateRequest = z.infer<typeof RunCreateRequestSchema>;
 
 export const ContinueRunRequestSchema = z.object({
-  questionId: z.string().optional(),
-  prompt: z.string().min(3).optional(),
+  questionId: ArtifactIdInputSchema.optional(),
+  prompt: optionalTrimmedString(z.string().min(3).max(4_000)),
   maxSearchTasks: z.number().int().min(1).max(6).optional(),
 });
 
 export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;
 
 export const FeedbackRequestSchema = z.object({
-  artifactId: z.string(),
+  artifactId: ArtifactIdInputSchema,
   rating: z.enum(["up", "down"]),
   dimension: z.enum(["usefulness", "credibility", "correctness", "citation_support", "insight_value", "report_value"]),
-  note: z.string().optional(),
+  note: optionalTrimmedString(z.string().max(2_000)),
 });
 
 export type FeedbackRequest = z.infer<typeof FeedbackRequestSchema>;

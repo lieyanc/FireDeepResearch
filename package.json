@@ -13,16 +13,25 @@
     "dev:web": "pnpm --filter @fdr/web dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "verify": "pnpm typecheck && pnpm test && pnpm build && pnpm smoke:api && pnpm smoke:local && pnpm smoke:live && git diff --check",
+    "verify:strict-live": "FDR_REQUIRE_LIVE_SMOKE=true pnpm verify",
+    "smoke:api": "node scripts/smoke-api.mjs",
+    "smoke:ui": "node scripts/smoke-ui.mjs",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "smoke:live:readiness": "tsx scripts/smoke-live-readiness.ts",
+    "smoke:live:providers": "tsx scripts/smoke-live-providers.ts",
+    "smoke:live:llm": "tsx scripts/smoke-live-llm.ts",
+    "smoke:live": "pnpm smoke:live:readiness && pnpm smoke:live:providers && pnpm smoke:live:llm"
   },
   "devDependencies": {
     "@types/node": "24.10.1",
     "@vitejs/plugin-react": "5.1.1",
     "concurrently": "9.2.1",
+    "dotenv": "17.4.2",
     "tsx": "4.21.0",
     "typescript": "5.9.3",
     "vite": "7.2.7",
     "vitest": "4.0.15"
   }
 }
-

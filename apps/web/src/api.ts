@@ -29,11 +29,31 @@ export const api = {
   apiUrl: API_URL,
 
   health() {
-    return request<{ ok: boolean; dataDir: string; searchProviders: string[]; fetchProvider: string }>("/api/health");
+    return request<{
+      ok: boolean;
+      dataDir: string;
+      searchProviders: string[];
+      fetchProvider: string;
+      llmRuntime: {
+        mode: "fallback" | "pi";
+        provider?: string;
+        model?: string;
+      };
+      researchLimits: {
+        maxSearchAgents: number;
+        maxReaderAgents: number;
+        maxCritiqueAgents: number;
+      };
+    }>("/api/health");
   },
 
   listRuns() {
     return request<{ runs: ResearchRun[] }>("/api/runs");
+  },
+
+  getMemory(domain?: string) {
+    const query = domain ? `?domain=${encodeURIComponent(domain)}` : "";
+    return request<{ memory: { global: ArtifactDocument[]; domain: ArtifactDocument[] } }>(`/api/memory${query}`);
   },
 
   createRun(input: RunCreateRequest) {
@@ -58,6 +78,12 @@ export const api = {
   readArtifact(runId: string, path: string) {
     return request<{ artifact: ArtifactDocument }>(
       `/api/runs/${encodeURIComponent(runId)}/artifacts/content?path=${encodeURIComponent(path)}`,
+    );
+  },
+
+  readArtifactById(runId: string, artifactId: string) {
+    return request<{ artifact: ArtifactDocument }>(
+      `/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
     );
   },
 

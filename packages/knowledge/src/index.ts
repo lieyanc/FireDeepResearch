@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import matter from "gray-matter";
 import type {
@@ -7,9 +7,9 @@ import type {
   ArtifactKind,
   ArtifactRef,
   FeedbackRequest,
-  ResearchEvent,
   ResearchRun,
 } from "@fdr/schemas";
+import { ResearchEventSchema, type ResearchEvent } from "@fdr/schemas";
 
 const RUN_SUBDIRS = [
   "sources",
@@ -22,6 +22,23 @@ const RUN_SUBDIRS = [
   "memory",
   "feedback",
 ] as const;
+
+const ARTIFACT_KINDS = new Set<ArtifactKind>([
+  "user_input",
+  "plan",
+  "blackboard",
+  "source",
+  "claim",
+  "question",
+  "critique",
+  "contradiction",
+  "ledger",
+  "memory",
+  "insight",
+  "audit",
+  "report",
+  "feedback",
+]);
 
 export interface MarkdownStoreOptions {
   dataDir: string;
@@ -43,11 +60,24 @@ export interface MemoryBundle {
   domain: ArtifactDocument[];
 }
 
+export interface ArtifactIndexEntry extends ArtifactRef {
+  frontmatter: Record<string, unknown>;
+}
+
+export interface ArtifactIndex {
+  all: ArtifactIndexEntry[];
+  byId: Map<string, ArtifactIndexEntry>;
+  byKind: Map<ArtifactKind, ArtifactIndexEntry[]>;
+  byTag: Map<string, ArtifactIndexEntry[]>;
+  byFrontmatterValue: Map<string, ArtifactIndexEntry[]>;
+}
+
 export interface SourceReputationSignal {
   up: number;
   down: number;
   adjustment: number;
   matchedFeedback: number;
+  trustedMatches: number;
 }
 
 function nowIso(): string {
@@ -75,6 +105,10 @@ function extractTitle(body: string, fallback: string): string {
   return heading?.[1]?.trim() || fallback;
 }
 
+function parseArtifactKind(value: unknown, fallback: ArtifactKind): ArtifactKind {
+  return typeof value === "string" && ARTIFACT_KINDS.has(value as ArtifactKind) ? (value as ArtifactKind) : fallback;
+}
+
 function normalizeReputationUrl(value?: string): string | undefined {
   if (!value) {
     return undefined;
@@ -89,6 +123,27 @@ function normalizeReputationUrl(value?: string): string | undefined {
 
 function normalizeTitle(value: string): string {
   return value.toLowerCase().replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
+}
+
+function reputationTargetMatches(input: {
+  targetUrl?: string;
+  targetTitle: string;
+  candidateUrl?: string;
+  candidateTitle?: string;
+  text?: string;
+}): boolean {
+  const candidateTitle = normalizeTitle(input.candidateTitle ?? "");
+  const normalizedText = normalizeTitle(input.text ?? "");
+  const urlMatches = Boolean(input.targetUrl && input.candidateUrl && input.targetUrl === input.candidateUrl);
+  const titleMatches = Boolean(
+    candidateTitle.length >= 8 &&
+      (input.targetTitle.includes(candidateTitle) || candidateTitle.includes(input.targetTitle)),
+  );
+  const textMatches = Boolean(
+    input.targetTitle.length >= 8 && normalizedText.length >= 8 && normalizedText.includes(input.targetTitle),
+  );
+  const urlTextMatches = Boolean(input.targetUrl && input.text && normalizeReputationUrl(input.text) === input.targetUrl);
+  return urlMatches || titleMatches || textMatches || urlTextMatches;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -111,6 +166,35 @@ function cleanFrontmatter(value: Record<string, unknown>): Record<string, unknow
   );
 }
 
+function parseResearchEventLine(line: string): ResearchEvent | undefined {
+  try {
+    const parsed = JSON.parse(line);
+    return ResearchEventSchema.safeParse(parsed).success ? (parsed as ResearchEvent) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function addToIndexMap<T>(map: Map<string, T[]>, key: string, value: T): void {
+  const existing = map.get(key) ?? [];
+  existing.push(value);
+  map.set(key, existing);
+}
+
+function frontmatterValueKeys(frontmatter: Record<string, unknown>): string[] {
+  return Object.entries(frontmatter).flatMap(([key, value]) => {
+    if (Array.isArray(value)) {
+      return value
+        .filter((item): item is string | number | boolean => ["string", "number", "boolean"].includes(typeof item))
+        .map((item) => `${key}:${String(item)}`);
+    }
+    if (["string", "number", "boolean"].includes(typeof value)) {
+      return [`${key}:${String(value)}`];
+    }
+    return [];
+  });
+}
+
 async function exists(filePath: string): Promise<boolean> {
   try {
     await stat(filePath);
@@ -118,6 +202,26 @@ async function exists(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, content);
+  await rename(tempPath, filePath);
+}
+
+async function appendFileAtomic(filePath: string, content: string): Promise<void> {
+  const existing = (await exists(filePath)) ? await readFile(filePath, "utf8") : "";
+  await writeFileAtomic(filePath, `${existing}${content}`);
+}
+
+function resolveInsideRoot(root: string, unsafePath: string): string | undefined {
+  const normalizedRoot = path.resolve(root);
+  const resolved = path.resolve(normalizedRoot, unsafePath);
+  if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
+    return undefined;
+  }
+  return resolved;
 }
 
 async function walkFiles(root: string): Promise<string[]> {
@@ -171,13 +275,14 @@ export class MarkdownStore {
     const run: ResearchRun = {
       id: runId,
       query: input.query,
+      domain: input.domain,
       status: "queued",
       createdAt: timestamp,
       updatedAt: timestamp,
       artifactRoot: root,
     };
 
-    await writeFile(path.join(root, "run.json"), JSON.stringify({ ...run, domain: input.domain }, null, 2));
+    await writeFileAtomic(path.join(root, "run.json"), JSON.stringify(run, null, 2));
     await this.writeArtifact({
       runId,
       kind: "user_input",
@@ -210,7 +315,7 @@ export class MarkdownStore {
 
   async updateRun(run: ResearchRun): Promise<ResearchRun> {
     const updated = { ...run, updatedAt: nowIso() };
-    await writeFile(path.join(this.runDir(run.id), "run.json"), JSON.stringify(updated, null, 2));
+    await writeFileAtomic(path.join(this.runDir(run.id), "run.json"), JSON.stringify(updated, null, 2));
     return updated;
   }
 
@@ -244,8 +349,12 @@ export class MarkdownStore {
     if (!(await exists(filePath))) {
       return [];
     }
-    const lines = (await readFile(filePath, "utf8")).split("\n").filter(Boolean);
-    return lines.map((line) => JSON.parse(line) as ResearchEvent);
+    return (await readFile(filePath, "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map(parseResearchEventLine)
+      .filter((event): event is ResearchEvent => Boolean(event));
   }
 
   artifactPath(input: WriteArtifactInput): string {
@@ -270,7 +379,7 @@ export class MarkdownStore {
     });
     const content = matter.stringify(input.body.trimEnd() + "\n", frontmatter);
     const frontmatterRecord = frontmatter as Record<string, unknown>;
-    await writeFile(filePath, content);
+    await writeFileAtomic(filePath, content);
     return {
       id: input.id,
       kind: input.kind,
@@ -284,17 +393,30 @@ export class MarkdownStore {
 
   async appendBlackboard(runId: string, sectionTitle: string, markdown: string): Promise<void> {
     const filePath = path.join(this.runDir(runId), "02_blackboard.md");
-    await appendFile(filePath, `\n## ${sectionTitle}\n\n${markdown.trim()}\n`);
+    const parsed = matter(await readFile(filePath, "utf8"));
+    const frontmatter = cleanFrontmatter({
+      ...parsed.data,
+      updated_at: nowIso(),
+    });
+    const section = `\n## ${sectionTitle}\n\n${markdown.trim()}\n`;
+    await writeFileAtomic(filePath, matter.stringify(`${parsed.content.trimEnd()}${section}`, frontmatter));
   }
 
   async readArtifact(runId: string, artifactPath: string): Promise<ArtifactDocument | undefined> {
-    const fullPath = path.join(this.runDir(runId), artifactPath);
+    if (!artifactPath.endsWith(".md")) {
+      return undefined;
+    }
+    const root = this.runDir(runId);
+    const fullPath = resolveInsideRoot(root, artifactPath);
+    if (!fullPath) {
+      return undefined;
+    }
     if (!(await exists(fullPath))) {
       return undefined;
     }
     const parsed = matter(await readFile(fullPath, "utf8"));
     const id = typeof parsed.data.id === "string" ? parsed.data.id : path.basename(artifactPath, ".md");
-    const kind = typeof parsed.data.type === "string" ? (parsed.data.type as ArtifactKind) : "source";
+    const kind = parseArtifactKind(parsed.data.type, "source");
     const title = typeof parsed.data.title === "string" ? parsed.data.title : extractTitle(parsed.content, id);
     return {
       id,
@@ -310,19 +432,43 @@ export class MarkdownStore {
   }
 
   async readArtifactById(runId: string, artifactId: string): Promise<ArtifactDocument | undefined> {
-    const artifacts = await this.listArtifacts(runId);
-    const match = artifacts.find((artifact) => artifact.id === artifactId);
+    const index = await this.buildArtifactIndex(runId);
+    const match = index.byId.get(artifactId);
     return match ? this.readArtifact(runId, match.path) : undefined;
   }
 
   async listArtifacts(runId: string): Promise<ArtifactRef[]> {
+    const index = await this.buildArtifactIndex(runId);
+    return index.all.map(({ frontmatter: _frontmatter, ...ref }) => ref);
+  }
+
+  async buildArtifactIndex(runId: string): Promise<ArtifactIndex> {
     const root = this.runDir(runId);
     const files = (await walkFiles(root)).filter((file) => file.endsWith(".md"));
     const docs = await Promise.all(files.map((file) => this.readArtifact(runId, path.relative(root, file))));
-    return docs
+    const all = docs
       .filter((doc): doc is ArtifactDocument => Boolean(doc))
-      .map(({ body: _body, frontmatter: _frontmatter, ...ref }) => ref)
+      .map(({ body: _body, ...entry }) => entry)
       .sort((a, b) => a.path.localeCompare(b.path));
+    const byId = new Map<string, ArtifactIndexEntry>();
+    const byKind = new Map<ArtifactKind, ArtifactIndexEntry[]>();
+    const byTag = new Map<string, ArtifactIndexEntry[]>();
+    const byFrontmatterValue = new Map<string, ArtifactIndexEntry[]>();
+
+    for (const entry of all) {
+      byId.set(entry.id, entry);
+      const kindEntries = byKind.get(entry.kind) ?? [];
+      kindEntries.push(entry);
+      byKind.set(entry.kind, kindEntries);
+      for (const tag of entry.tags) {
+        addToIndexMap(byTag, tag, entry);
+      }
+      for (const key of frontmatterValueKeys(entry.frontmatter)) {
+        addToIndexMap(byFrontmatterValue, key, entry);
+      }
+    }
+
+    return { all, byId, byKind, byTag, byFrontmatterValue };
   }
 
   async loadMemory(domain?: string): Promise<MemoryBundle> {
@@ -338,7 +484,7 @@ export class MarkdownStore {
   }
 
   async appendFeedback(runId: string, feedback: FeedbackRequest): Promise<ArtifactRef> {
-    const id = `feedback-${Date.now()}`;
+    const id = `feedback-${Date.now()}-${randomUUID().slice(0, 8)}`;
     return this.writeArtifact({
       runId,
       kind: "feedback",
@@ -356,17 +502,58 @@ export class MarkdownStore {
     });
   }
 
+  async appendFeedbackToArtifact(runId: string, feedback: FeedbackRequest, feedbackArtifact: ArtifactRef): Promise<ArtifactRef | undefined> {
+    const target = (await this.listArtifacts(runId)).find((artifact) => artifact.id === feedback.artifactId);
+    if (!target) {
+      return undefined;
+    }
+
+    const filePath = path.join(this.runDir(runId), target.path);
+    const parsed = matter(await readFile(filePath, "utf8"));
+    const timestamp = nowIso();
+    const priorCount = typeof parsed.data.feedback_count === "number" ? parsed.data.feedback_count : 0;
+    const frontmatter = cleanFrontmatter({
+      ...parsed.data,
+      updated_at: timestamp,
+      feedback_count: priorCount + 1,
+      latest_feedback: feedbackArtifact.id,
+    });
+    const feedbackSnippet = [
+      "",
+      "## Human Feedback",
+      "",
+      `- Feedback artifact: ${feedbackArtifact.id}`,
+      `- Rating: ${feedback.rating}`,
+      `- Dimension: ${feedback.dimension}`,
+      feedback.note ? `- Note: ${feedback.note}` : undefined,
+      `- Recorded at: ${timestamp}`,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    await writeFileAtomic(filePath, matter.stringify(`${parsed.content.trimEnd()}\n${feedbackSnippet}\n`, frontmatter));
+    return this.readArtifact(runId, target.path);
+  }
+
   async appendSourceReputationFeedback(input: {
     runId: string;
     feedback: FeedbackRequest;
     artifact?: ArtifactDocument;
   }): Promise<void> {
     await this.ensureBase();
-    const filePath = path.join(this.globalDir, "source_reputation.md");
     const artifact = input.artifact;
+    if (artifact?.kind !== "source") {
+      return;
+    }
+    const filePath = path.join(this.globalDir, "source_reputation.md");
     const url = typeof artifact?.frontmatter.url === "string" ? artifact.frontmatter.url : undefined;
     const title = artifact?.title ?? input.feedback.artifactId;
     const timestamp = nowIso();
+    const existing = (await exists(filePath))
+      ? matter(await readFile(filePath, "utf8"))
+      : {
+          data: { type: "source_reputation", title: "Source Reputation" },
+          content: ["# Source Reputation", "", "Human source feedback is appended here after source reviews."].join("\n"),
+        };
     const section = [
       "",
       `## Feedback ${timestamp}`,
@@ -382,7 +569,118 @@ export class MarkdownStore {
     ]
       .filter((line): line is string => line !== undefined)
       .join("\n");
-    await appendFile(filePath, section);
+    const frontmatter = cleanFrontmatter({
+      ...existing.data,
+      type: existing.data.type ?? "source_reputation",
+      title: existing.data.title ?? "Source Reputation",
+      updated_at: timestamp,
+    });
+    await writeFileAtomic(filePath, matter.stringify(`${existing.content.trimEnd()}${section}\n`, frontmatter));
+  }
+
+  async appendDomainTrustedSourceFeedback(input: {
+    runId: string;
+    domain?: string;
+    feedback: FeedbackRequest;
+    artifact?: ArtifactDocument;
+  }): Promise<void> {
+    await this.ensureBase();
+    if (!input.domain || input.feedback.rating !== "up" || input.artifact?.kind !== "source") {
+      return;
+    }
+    const domainDir = path.join(this.domainsDir, safeId(input.domain));
+    await mkdir(domainDir, { recursive: true });
+    const filePath = path.join(domainDir, "trusted_sources.md");
+    const url = typeof input.artifact.frontmatter.url === "string" ? input.artifact.frontmatter.url : undefined;
+    const timestamp = nowIso();
+    const existing = (await exists(filePath))
+      ? matter(await readFile(filePath, "utf8"))
+      : {
+          data: { type: "trusted_sources", title: "Trusted Sources" },
+          content: ["# Trusted Sources", "", "Domain-specific trusted source feedback is appended here."].join("\n"),
+        };
+    const targetUrl = normalizeReputationUrl(url);
+    const targetTitle = normalizeTitle(input.artifact.title);
+    if (
+      existing.content.split(/\n(?=##\s+Trusted Source )/g).some((block) =>
+        reputationTargetMatches({
+          targetUrl,
+          targetTitle,
+          candidateUrl: normalizeReputationUrl(block.match(/^- URL:\s*(.+)$/m)?.[1]?.trim()),
+          candidateTitle: block.match(/^- Title:\s*(.+)$/m)?.[1]?.trim(),
+          text: block,
+        }),
+      )
+    ) {
+      return;
+    }
+    const section = [
+      "",
+      `## Trusted Source ${timestamp}`,
+      "",
+      `- Run: ${input.runId}`,
+      `- Artifact: ${input.feedback.artifactId}`,
+      `- Title: ${input.artifact.title}`,
+      url ? `- URL: ${url}` : undefined,
+      `- Dimension: ${input.feedback.dimension}`,
+      input.feedback.note ? `- Note: ${input.feedback.note}` : undefined,
+      "",
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    const frontmatter = cleanFrontmatter({
+      ...existing.data,
+      type: existing.data.type ?? "trusted_sources",
+      title: existing.data.title ?? "Trusted Sources",
+      updated_at: timestamp,
+    });
+    await writeFileAtomic(filePath, matter.stringify(`${existing.content.trimEnd()}${section}\n`, frontmatter));
+  }
+
+  async appendUserFeedbackMemory(input: {
+    runId: string;
+    feedback: FeedbackRequest;
+    artifact: ArtifactDocument;
+  }): Promise<void> {
+    await this.ensureBase();
+    if (input.artifact.kind === "source") {
+      return;
+    }
+    const filePath = path.join(this.globalDir, "user_preferences.md");
+    const timestamp = nowIso();
+    const existing = (await exists(filePath))
+      ? matter(await readFile(filePath, "utf8"))
+      : {
+          data: { type: "user_preferences", title: "User Preferences" },
+          content: ["# User Preferences", "", "Reusable human feedback from prior research runs is appended here."].join("\n"),
+        };
+    const guidance =
+      input.feedback.rating === "up"
+        ? "Prefer similar handling in future runs."
+        : "Avoid or scrutinize similar handling in future runs.";
+    const section = [
+      "",
+      `## Feedback ${timestamp}`,
+      "",
+      `- Run: ${input.runId}`,
+      `- Artifact: ${input.feedback.artifactId}`,
+      `- Artifact kind: ${input.artifact.kind}`,
+      `- Title: ${input.artifact.title}`,
+      `- Rating: ${input.feedback.rating}`,
+      `- Dimension: ${input.feedback.dimension}`,
+      input.feedback.note ? `- Note: ${input.feedback.note}` : undefined,
+      `- Guidance: ${guidance}`,
+      "",
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    const frontmatter = cleanFrontmatter({
+      ...existing.data,
+      type: existing.data.type ?? "user_preferences",
+      title: existing.data.title ?? "User Preferences",
+      updated_at: timestamp,
+    });
+    await writeFileAtomic(filePath, matter.stringify(`${existing.content.trimEnd()}${section}\n`, frontmatter));
   }
 
   async appendRecurringLesson(input: {
@@ -395,22 +693,13 @@ export class MarkdownStore {
   }): Promise<void> {
     await this.ensureBase();
     const filePath = path.join(this.globalDir, "recurring_lessons.md");
-    if (!(await exists(filePath))) {
-      await writeFile(
-        filePath,
-        [
-          "---",
-          "type: recurring_lessons",
-          `updated_at: ${nowIso()}`,
-          "---",
-          "",
-          "# Recurring Lessons",
-          "",
-          "Reusable research lessons are appended here after runs complete.",
-          "",
-        ].join("\n"),
-      );
-    }
+    const timestamp = nowIso();
+    const existing = (await exists(filePath))
+      ? matter(await readFile(filePath, "utf8"))
+      : {
+          data: { type: "recurring_lessons" },
+          content: ["# Recurring Lessons", "", "Reusable research lessons are appended here after runs complete."].join("\n"),
+        };
     const section = [
       "",
       `## ${input.title}`,
@@ -428,41 +717,73 @@ export class MarkdownStore {
     ]
       .filter((line): line is string => line !== undefined)
       .join("\n");
-    await appendFile(filePath, section);
+    const frontmatter = cleanFrontmatter({
+      ...existing.data,
+      type: existing.data.type ?? "recurring_lessons",
+      updated_at: timestamp,
+    });
+    await writeFileAtomic(filePath, matter.stringify(`${existing.content.trimEnd()}${section}\n`, frontmatter));
   }
 
-  async getSourceReputation(input: { url?: string; title: string }): Promise<SourceReputationSignal> {
+  async getSourceReputation(input: { url?: string; title: string; domain?: string }): Promise<SourceReputationSignal> {
     await this.ensureBase();
     const filePath = path.join(this.globalDir, "source_reputation.md");
-    if (!(await exists(filePath))) {
-      return { up: 0, down: 0, adjustment: 0, matchedFeedback: 0 };
-    }
-
-    const content = await readFile(filePath, "utf8");
     const targetUrl = normalizeReputationUrl(input.url);
     const targetTitle = normalizeTitle(input.title);
     let up = 0;
     let down = 0;
+    let trustedMatches = 0;
 
-    for (const block of content.split(/\n## Feedback /g).slice(1)) {
-      const blockUrl = normalizeReputationUrl(block.match(/^- URL:\s*(.+)$/m)?.[1]?.trim());
-      const blockTitle = normalizeTitle(block.match(/^- Title:\s*(.+)$/m)?.[1]?.trim() ?? "");
-      const rating = block.match(/^- Rating:\s*(up|down)$/m)?.[1];
-      const urlMatches = Boolean(targetUrl && blockUrl && targetUrl === blockUrl);
-      const titleMatches = Boolean(blockTitle && (targetTitle.includes(blockTitle) || blockTitle.includes(targetTitle)));
-      if (!rating || (!urlMatches && !titleMatches)) {
-        continue;
+    if (await exists(filePath)) {
+      const content = await readFile(filePath, "utf8");
+      for (const block of content.split(/\n## Feedback /g).slice(1)) {
+        const blockUrl = normalizeReputationUrl(block.match(/^- URL:\s*(.+)$/m)?.[1]?.trim());
+        const blockTitle = block.match(/^- Title:\s*(.+)$/m)?.[1]?.trim();
+        const rating = block.match(/^- Rating:\s*(up|down)$/m)?.[1];
+        if (
+          !rating ||
+          !reputationTargetMatches({
+            targetUrl,
+            targetTitle,
+            candidateUrl: blockUrl,
+            candidateTitle: blockTitle,
+          })
+        ) {
+          continue;
+        }
+        if (rating === "up") {
+          up += 1;
+        } else {
+          down += 1;
+        }
       }
-      if (rating === "up") {
-        up += 1;
-      } else {
-        down += 1;
+    }
+
+    if (input.domain) {
+      const trustedPath = path.join(this.domainsDir, safeId(input.domain), "trusted_sources.md");
+      if (await exists(trustedPath)) {
+        const trustedContent = await readFile(trustedPath, "utf8");
+        for (const line of trustedContent.split("\n")) {
+          const url = line.match(/https?:\/\/[^\s)>\]]+/)?.[0];
+          if (
+            reputationTargetMatches({
+              targetUrl,
+              targetTitle,
+              candidateUrl: normalizeReputationUrl(url),
+              text: line,
+            })
+          ) {
+            trustedMatches += 1;
+          }
+        }
       }
     }
 
     const matchedFeedback = up + down;
-    const adjustment = matchedFeedback === 0 ? 0 : Number(clamp((up - down) * 0.04, -0.18, 0.18).toFixed(2));
-    return { up, down, adjustment, matchedFeedback };
+    const feedbackAdjustment = matchedFeedback === 0 ? 0 : (up - down) * 0.04;
+    const trustedAdjustment = trustedMatches > 0 ? 0.08 : 0;
+    const adjustment = Number(clamp(feedbackAdjustment + trustedAdjustment, -0.18, 0.22).toFixed(2));
+    return { up, down, adjustment, matchedFeedback, trustedMatches };
   }
 
   private async readLooseArtifact(filePath: string, root: string): Promise<ArtifactDocument | undefined> {
@@ -472,7 +793,7 @@ export class MarkdownStore {
     const parsed = matter(await readFile(filePath, "utf8"));
     const relativePath = path.relative(root, filePath);
     const id = typeof parsed.data.id === "string" ? parsed.data.id : path.basename(filePath, ".md");
-    const kind = typeof parsed.data.type === "string" ? (parsed.data.type as ArtifactKind) : "source";
+    const kind = parseArtifactKind(parsed.data.type, "memory");
     const title = typeof parsed.data.title === "string" ? parsed.data.title : extractTitle(parsed.content, id);
     return {
       id,

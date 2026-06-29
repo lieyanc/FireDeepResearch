@@ -431,7 +431,7 @@ export class MockSearchProvider implements SearchProvider {
     const normalized = query.task.query.toLowerCase();
     const ranked = MOCK_CONTENT.map((item, index) => ({
       provider: this.name,
-      title: `${item.title} (${query.task.angle})`,
+      title: item.title,
       url: `${item.url}?angle=${encodeURIComponent(query.task.angle)}&q=${encodeURIComponent(normalized.slice(0, 40))}`,
       snippet: item.snippet,
       content: item.content,
@@ -482,7 +482,14 @@ export function createProviderRegistryFromEnv(): ProviderRegistry {
 }
 
 export function inferSourceKind(url: string, title: string): SourceKind {
-  const combined = `${url} ${title}`.toLowerCase();
+  let inspectableUrl = url;
+  try {
+    const parsed = new URL(url);
+    inspectableUrl = `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    inspectableUrl = url.split(/[?#]/)[0] || url;
+  }
+  const combined = `${inspectableUrl} ${title}`.toLowerCase();
   if (combined.includes("docs") || combined.includes("official") || combined.includes("/official/")) {
     return "official";
   }

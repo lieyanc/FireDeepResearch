@@ -148,6 +148,13 @@ Skeptic and question agents run against claims and emerging insights:
 
 This phase may loop back to search and reading.
 
+Implemented loop behavior:
+
+- The highest-risk generated question is selected automatically.
+- Two bounded search tasks run in parallel: independent corroboration and counter-evidence.
+- The resulting sources, claims, challenges, audits, contradiction matrix, and evidence ledger are written with `auto_deep_dive` metadata.
+- Final synthesis includes an `Auto Deep Dive` section before the report is marked finished.
+
 ### Phase 6: Insight Mining
 
 Insight Miner looks for:
@@ -167,6 +174,8 @@ Auditor checks:
 - Whether source quality is acceptable.
 - Whether opposing evidence exists.
 - Whether confidence should be downgraded.
+
+Implemented audit artifacts include the cited source check, related open question artifacts, and opposing or qualifying source candidates in both body text and frontmatter.
 
 ### Phase 8: Report
 
@@ -261,6 +270,8 @@ Context builder responsibilities:
 - Include recent events.
 - Include relevant artifacts by links, tags, and frontmatter.
 - Summarize older blackboard state when context grows.
+
+Implemented role context packages include the root input, current run state, global/domain memory, recent event history, an artifact inventory built from the local frontmatter index, an explicit task/role block, and task-specific blocks such as claims, sources, follow-up focus, or proposed search tasks. When the blackboard grows, older sections are reduced to a heading summary while recent sections stay visible.
 
 ## Markdown Knowledge Layout
 
@@ -414,6 +425,8 @@ knowledge/global/source_reputation.md
 knowledge/domains/<domain>/trusted_sources.md
 ```
 
+Implemented scoring uses both global source feedback and domain `trusted_sources.md` matches. Global feedback can move credibility up or down; domain trusted-source matches add a bounded positive adjustment for sources known to be reliable in that domain. Upvoted source feedback on domain-scoped runs is appended to that domain's `trusted_sources.md`, de-duplicated by normalized source URL/title.
+
 ## Human Feedback
 
 Frontend should allow rating:
@@ -425,13 +438,14 @@ Frontend should allow rating:
 - Insight usefulness.
 - Report usefulness.
 
-Feedback writes Markdown snippets into the relevant artifact and optionally updates global memory.
+Feedback validates that the target artifact exists, then writes Markdown snippets into the relevant artifact. Source feedback updates global source reputation memory and, for upvoted source feedback in domain-scoped runs, domain trusted-source memory. Non-source feedback is appended to global user preference memory so later role context can inherit report, citation, claim, and insight preferences.
 
 ## API Sketch
 
 ```http
 POST /api/runs
 GET  /api/runs/:runId
+GET  /api/memory?domain=<domain>
 GET  /api/runs/:runId/events
 GET  /api/runs/:runId/artifacts
 GET  /api/runs/:runId/artifacts/:artifactId
@@ -441,38 +455,57 @@ POST /api/runs/:runId/cancel
 ```
 
 `GET /api/runs/:runId/events` uses SSE.
+Cancelling an active run aborts in-flight work and persists `cancelled` status; user cancellation should not be reported as `failed`.
+Execution failures emit both `run.failed` and a terminal `run.updated` event with `failed` status.
+Run creation accepts an optional `domain` field. The domain is stored with the run and used to load `knowledge/domains/<domain>/` memory.
+User-provided query, run domain, memory query domain, prompt, artifact id, and feedback note fields are validated and bounded before they can affect Markdown paths, artifact lookup, or memory files.
+Follow-up continuations inherit the run domain by default so domain memory and memory-update metadata remain continuous.
+Continuation requests that reference a generated question validate the question artifact before the run is marked active; missing questions return `404`.
+`GET /api/memory` returns global and optional domain memory documents normalized as memory artifacts.
+Artifact content reads are constrained to Markdown files inside the selected run directory.
+Run-scoped event, artifact, and feedback endpoints validate that the run exists before returning nested resources.
+Event history replay skips malformed or partial JSONL lines so a damaged journal entry does not break the run view.
+Search task ids include phase/iteration prefixes so repeated continuations remain distinguishable in the event log.
 
 ## Event Types
 
 ```ts
 type ResearchEvent =
-  | { type: "run.created"; runId: string }
-  | { type: "agent.started"; runId: string; agent: string; taskId: string }
-  | { type: "agent.message.delta"; runId: string; agent: string; text: string }
-  | { type: "tool.started"; runId: string; tool: string; taskId: string }
-  | { type: "tool.finished"; runId: string; tool: string; taskId: string }
-  | { type: "artifact.created"; runId: string; artifactId: string; path: string }
-  | { type: "claim.challenged"; runId: string; claimId: string; questionId: string }
-  | { type: "insight.created"; runId: string; insightId: string }
-  | { type: "run.finished"; runId: string };
+  | { type: "run.created"; runId: string; at: string }
+  | { type: "run.updated"; runId: string; status: "queued" | "running" | "finished" | "failed" | "cancelled"; at: string }
+  | { type: "agent.started"; runId: string; agent: string; taskId: string; label: string; at: string }
+  | { type: "agent.finished"; runId: string; agent: string; taskId: string; usedPi?: boolean; model?: string; durationMs?: number; at: string }
+  | { type: "agent.message.delta"; runId: string; agent: string; taskId: string; text: string; at: string }
+  | { type: "tool.started"; runId: string; tool: string; taskId: string; at: string }
+  | { type: "tool.finished"; runId: string; tool: string; taskId: string; ok: boolean; error?: string; durationMs?: number; at: string }
+  | { type: "artifact.created"; runId: string; artifact: ArtifactRef; at: string }
+  | { type: "artifact.updated"; runId: string; artifact: ArtifactRef; at: string }
+  | { type: "claim.challenged"; runId: string; claimId: string; questionId: string; severity: "low" | "medium" | "high"; at: string }
+  | { type: "insight.created"; runId: string; insightId: string; novelty: "low" | "medium" | "high"; at: string }
+  | { type: "deep_dive.started"; runId: string; questionId: string; targetClaimId?: string; prompt: string; at: string }
+  | { type: "deep_dive.finished"; runId: string; questionId: string; critiqueId: string; sourceCount: number; claimCount: number; at: string }
+  | { type: "continuation.started"; runId: string; questionId?: string; prompt: string; at: string }
+  | { type: "continuation.finished"; runId: string; reportPath: string; at: string }
+  | { type: "run.finished"; runId: string; reportPath: string; at: string }
+  | { type: "run.failed"; runId: string; error: string; at: string };
 ```
 
 ## Frontend Product Shape
 
 Use React + Vite and shadcn/ui components. The app should feel like a research cockpit:
 
-- Left rail: run list, domain memory, provider status.
+- Left rail: run list, domain memory, provider/model status.
 - Main pane: live research timeline and final report.
 - Right pane: selected artifact detail, evidence, critiques, feedback.
-- Top bar: query, run status, model/provider cost, concurrency state.
+- Top bar: query, run status, model/provider runtime, run telemetry, and concurrency state.
 - Tabs: Report, Claims, Sources, Questions, Insights, Audit.
 
 Important UI behaviors:
 
-- Click a report paragraph to reveal linked claims and sources.
+- Click artifact id chips in a report or evidence artifact to reveal linked claims, sources, questions, audits, ledgers, and insights.
 - Click a claim to reveal evidence, challenges, and audit status.
 - Show parallel agents as live task cards.
-- Let the user upvote/downvote source, claim, citation, and insight quality.
+- Let the user upvote/downvote source, claim, citation, insight, report, and general usefulness dimensions, with optional notes.
 - Avoid landing-page layout. The first screen should be the actual research cockpit.
 
 ## Configuration
@@ -497,9 +530,9 @@ FIRECRAWL_API_KEY=
 VITE_API_URL=http://localhost:8787
 ```
 
-Pi model provider credentials, such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, Azure OpenAI, Mistral, Groq, or OpenRouter keys, are loaded by `@earendil-works/pi-ai` according to the selected model provider.
+The API health endpoint exposes the selected Pi provider/model or deterministic fallback mode, without exposing credentials. Pi model provider credentials, such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, Azure OpenAI, Mistral, Groq, or OpenRouter keys, are loaded by `@earendil-works/pi-ai` according to the selected model provider.
 
-Commercial provider calls use per-attempt timeout and retry settings. Search/fetch failures are emitted as structured tool events with an error message, and the run continues with partial evidence unless all later stages have no usable artifacts.
+Commercial provider calls use per-attempt timeout and retry settings. Search/fetch failures are emitted as structured tool events with an error message, and the run continues with partial evidence unless all later stages have no usable artifacts. Initial runs and continuations fail explicitly with `run.failed` instead of writing an empty report when no usable sources are collected.
 
 ## MVP Milestones
 
@@ -509,6 +542,8 @@ Commercial provider calls use per-attempt timeout and retry settings. Search/fet
 - Write/read artifacts.
 - Append JSONL events.
 - Build local in-memory index from Markdown frontmatter.
+
+Implemented artifact indexing builds an in-memory index from Markdown frontmatter for id, kind, tag, and scalar/array frontmatter value lookup.
 
 ### Milestone 2: Provider adapters
 

@@ -20,16 +20,30 @@ import {
   ThumbsDown,
   ThumbsUp,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { api } from "./api";
+import { bodyRefs, frontmatterRefs } from "./artifactRefs";
+import { MarkdownView } from "./MarkdownView";
 
 type ArtifactTab = "report" | "ledger" | "check" | "claim" | "source" | "question" | "insight" | "audit" | "memory";
+type StreamState = "idle" | "connecting" | "live" | "reconnecting" | "closed";
 
 interface HealthState {
   ok: boolean;
   dataDir: string;
   searchProviders: string[];
   fetchProvider: string;
+  llmRuntime: {
+    mode: "fallback" | "pi";
+    provider?: string;
+    model?: string;
+  };
+  researchLimits: {
+    maxSearchAgents: number;
+    maxReaderAgents: number;
+    maxCritiqueAgents: number;
+  };
 }
 
 const SAMPLE_QUERY =
@@ -59,26 +73,130 @@ const tabKinds: Record<ArtifactTab, ArtifactKind[]> = {
   memory: ["memory", "feedback"],
 };
 
+const feedbackDimensionLabels: Record<FeedbackRequest["dimension"], string> = {
+  usefulness: "Usefulness",
+  credibility: "Credibility",
+  correctness: "Correctness",
+  citation_support: "Citation support",
+  insight_value: "Insight value",
+  report_value: "Report value",
+};
+
 function cn(...values: Array<string | false | undefined>): string {
   return values.filter(Boolean).join(" ");
 }
 
-function asStringArray(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value.filter((item): item is string => typeof item === "string");
+function formatLlmRuntime(health?: HealthState): string {
+  if (!health) {
+    return "llm";
   }
-  return typeof value === "string" && value ? [value] : [];
+  const { llmRuntime } = health;
+  return llmRuntime.mode === "pi" && llmRuntime.provider && llmRuntime.model
+    ? `${llmRuntime.provider}/${llmRuntime.model}`
+    : "fallback";
 }
 
-function frontmatterRefs(frontmatter: Record<string, unknown>): string[] {
-  return [
-    ...asStringArray(frontmatter.sources),
-    ...asStringArray(frontmatter.source),
-    ...asStringArray(frontmatter.target),
-    ...asStringArray(frontmatter.question_id),
-    ...asStringArray(frontmatter.artifact_id),
-    ...asStringArray(frontmatter.opposes),
-  ];
+function formatDuration(durationMs?: number): string {
+  if (typeof durationMs !== "number") {
+    return "";
+  }
+  if (durationMs < 1_000) {
+    return `${durationMs}ms`;
+  }
+  return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
+}
+
+function streamStatusLabel(state: StreamState): string {
+  switch (state) {
+    case "connecting":
+      return "Connecting";
+    case "live":
+      return "Stream live";
+    case "reconnecting":
+      return "Reconnecting";
+    case "closed":
+      return "Stream closed";
+    case "idle":
+      return "No stream";
+  }
+}
+
+function defaultFeedbackDimension(kind: ArtifactKind): FeedbackRequest["dimension"] {
+  if (kind === "source") {
+    return "credibility";
+  }
+  if (kind === "claim") {
+    return "correctness";
+  }
+  if (kind === "audit") {
+    return "citation_support";
+  }
+  if (kind === "insight") {
+    return "insight_value";
+  }
+  if (kind === "report") {
+    return "report_value";
+  }
+  return "usefulness";
+}
+
+function compactBody(value: string, maxLength = 180): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length <= maxLength ? compact : `${compact.slice(0, maxLength - 1)}...`;
+}
+
+function artifactTime(artifact: ArtifactRef): number {
+  return Date.parse(artifact.updatedAt ?? artifact.createdAt ?? "") || 0;
+}
+
+function eventKey(event: ResearchEvent): string {
+  switch (event.type) {
+    case "run.updated":
+      return `${event.type}:${event.runId}:${event.status}:${event.at}`;
+    case "agent.started":
+      return `${event.type}:${event.runId}:${event.taskId}:${event.label}:${event.at}`;
+    case "agent.finished":
+      return `${event.type}:${event.runId}:${event.taskId}:${event.durationMs ?? ""}:${event.at}`;
+    case "agent.message.delta":
+      return `${event.type}:${event.runId}:${event.taskId}:${event.text}:${event.at}`;
+    case "tool.started":
+    case "tool.finished":
+      return `${event.type}:${event.runId}:${event.taskId}:${event.tool}:${event.at}`;
+    case "artifact.created":
+    case "artifact.updated":
+      return `${event.type}:${event.runId}:${event.artifact.id}:${event.at}`;
+    case "claim.challenged":
+      return `${event.type}:${event.runId}:${event.claimId}:${event.questionId}:${event.at}`;
+    case "insight.created":
+      return `${event.type}:${event.runId}:${event.insightId}:${event.at}`;
+    case "deep_dive.started":
+    case "deep_dive.finished":
+      return `${event.type}:${event.runId}:${event.questionId}:${event.at}`;
+    case "continuation.started":
+      return `${event.type}:${event.runId}:${event.questionId ?? ""}:${event.prompt}:${event.at}`;
+    case "continuation.finished":
+    case "run.finished":
+      return `${event.type}:${event.runId}:${event.reportPath}:${event.at}`;
+    case "run.failed":
+      return `${event.type}:${event.runId}:${event.error}:${event.at}`;
+    case "run.created":
+      return `${event.type}:${event.runId}:${event.at}`;
+  }
+}
+
+function mergeEvents(current: ResearchEvent[], incoming: ResearchEvent[]): ResearchEvent[] {
+  const seen = new Set<string>();
+  return [...current, ...incoming]
+    .filter((event) => {
+      const key = eventKey(event);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
+    .slice(-300);
 }
 
 function formatTime(value?: string): string {
@@ -110,10 +228,16 @@ function eventLabel(event: ResearchEvent): string {
       return `${event.tool} ${event.ok ? "finished" : "failed"}`;
     case "artifact.created":
       return `${event.artifact.kind} created`;
+    case "artifact.updated":
+      return `${event.artifact.kind} updated`;
     case "claim.challenged":
       return `${event.claimId} challenged`;
     case "insight.created":
       return `${event.insightId} created`;
+    case "deep_dive.started":
+      return "Auto deep dive started";
+    case "deep_dive.finished":
+      return "Auto deep dive finished";
     case "run.finished":
       return "Run finished";
     case "continuation.started":
@@ -132,13 +256,13 @@ function eventIcon(event: ResearchEvent) {
   if (event.type === "insight.created") {
     return <Lightbulb size={15} />;
   }
-  if (event.type.startsWith("continuation")) {
+  if (event.type.startsWith("continuation") || event.type.startsWith("deep_dive")) {
     return <Sparkles size={15} />;
   }
   if (event.type === "claim.challenged") {
     return <MessageSquareWarning size={15} />;
   }
-  if (event.type === "artifact.created") {
+  if (event.type === "artifact.created" || event.type === "artifact.updated") {
     return <FileText size={15} />;
   }
   if (event.type.includes("agent")) {
@@ -152,14 +276,23 @@ function eventIcon(event: ResearchEvent) {
 
 function eventDetail(event: ResearchEvent): string {
   switch (event.type) {
+    case "agent.finished":
+      return [event.usedPi ? event.model ?? "Pi runtime" : event.usedPi === false ? "fallback runtime" : "", formatDuration(event.durationMs)]
+        .filter(Boolean)
+        .join(" - ");
     case "agent.message.delta":
       return event.text;
     case "artifact.created":
+    case "artifact.updated":
       return event.artifact.title;
     case "claim.challenged":
       return `${event.questionId} (${event.severity})`;
     case "tool.finished":
-      return event.ok ? "" : event.error ?? "Tool call failed";
+      return [event.ok ? "" : event.error ?? "Tool call failed", formatDuration(event.durationMs)].filter(Boolean).join(" - ");
+    case "deep_dive.started":
+      return event.targetClaimId ? `${event.questionId} -> ${event.targetClaimId}: ${event.prompt}` : `${event.questionId}: ${event.prompt}`;
+    case "deep_dive.finished":
+      return `${event.critiqueId}: ${event.sourceCount} sources, ${event.claimCount} claims`;
     case "run.failed":
       return event.error;
     case "run.finished":
@@ -173,51 +306,65 @@ function eventDetail(event: ResearchEvent): string {
   }
 }
 
-function MarkdownView({ body }: { body: string }) {
-  const blocks = body.split("\n");
+function isTerminalRunEvent(event: ResearchEvent): boolean {
   return (
-    <div className="markdown-view">
-      {blocks.map((line, index) => {
-        if (line.startsWith("# ")) {
-          return <h1 key={index}>{line.slice(2)}</h1>;
-        }
-        if (line.startsWith("## ")) {
-          return <h2 key={index}>{line.slice(3)}</h2>;
-        }
-        if (line.startsWith("### ")) {
-          return <h3 key={index}>{line.slice(4)}</h3>;
-        }
-        if (line.startsWith("> ")) {
-          return <blockquote key={index}>{line.slice(2)}</blockquote>;
-        }
-        if (line.startsWith("- ")) {
-          return <li key={index}>{line.slice(2)}</li>;
-        }
-        if (!line.trim()) {
-          return <div key={index} className="md-gap" />;
-        }
-        return <p key={index}>{line}</p>;
-      })}
-    </div>
+    event.type === "run.finished" ||
+    event.type === "run.failed" ||
+    (event.type === "run.updated" && ["finished", "failed", "cancelled"].includes(event.status))
   );
 }
 
 export function App() {
   const [query, setQuery] = useState(SAMPLE_QUERY);
+  const [domain, setDomain] = useState("ai-coding-agents");
   const [runs, setRuns] = useState<ResearchRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string>();
   const [events, setEvents] = useState<ResearchEvent[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
   const [artifactDocsByPath, setArtifactDocsByPath] = useState<Record<string, ArtifactDocument>>({});
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactDocument>();
+  const [memoryDocs, setMemoryDocs] = useState<{ global: ArtifactDocument[]; domain: ArtifactDocument[] }>({
+    global: [],
+    domain: [],
+  });
   const [activeTab, setActiveTab] = useState<ArtifactTab>("report");
   const [health, setHealth] = useState<HealthState>();
   const [isStarting, setIsStarting] = useState(false);
   const [isContinuing, setIsContinuing] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const [feedbackInFlight, setFeedbackInFlight] = useState<FeedbackRequest["rating"]>();
   const [error, setError] = useState<string>();
+  const [streamState, setStreamState] = useState<StreamState>("idle");
+  const [feedbackDimension, setFeedbackDimension] = useState<FeedbackRequest["dimension"]>("usefulness");
+  const [feedbackNote, setFeedbackNote] = useState("");
   const eventSourceRef = useRef<EventSource | null>(null);
+  const selectedArtifactRef = useRef<ArtifactDocument | undefined>(undefined);
 
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId), [runs, selectedRunId]);
+  const effectiveDomain = useMemo(() => (selectedRun?.domain ?? domain.trim()) || undefined, [domain, selectedRun?.domain]);
+
+  const runTelemetry = useMemo(() => {
+    const finishedAgents = events.filter((event): event is ResearchEvent & { type: "agent.finished" } => event.type === "agent.finished");
+    const finishedTools = events.filter((event): event is ResearchEvent & { type: "tool.finished" } => event.type === "tool.finished");
+    const measuredAgentDurations = finishedAgents
+      .map((event) => event.durationMs)
+      .filter((duration): duration is number => typeof duration === "number");
+    const runtimeMs = selectedRun
+      ? Math.max(0, Date.parse(selectedRun.updatedAt) - Date.parse(selectedRun.createdAt))
+      : undefined;
+    const averageAgentDurationMs =
+      measuredAgentDurations.length > 0
+        ? Math.round(measuredAgentDurations.reduce((total, duration) => total + duration, 0) / measuredAgentDurations.length)
+        : undefined;
+
+    return {
+      runtimeMs,
+      finishedAgentCount: finishedAgents.length,
+      averageAgentDurationMs,
+      toolFailureCount: finishedTools.filter((event) => !event.ok).length,
+      fallbackAgentCount: finishedAgents.filter((event) => event.usedPi === false).length,
+    };
+  }, [events, selectedRun]);
 
   const artifactCounts = useMemo(() => {
     return Object.fromEntries(
@@ -230,14 +377,20 @@ export function App() {
     return artifacts.filter((artifact) => kinds.includes(artifact.kind));
   }, [activeTab, artifacts]);
 
+  const artifactById = useMemo(() => new Map(artifacts.map((artifact) => [artifact.id, artifact])), [artifacts]);
+
   const linkedArtifacts = useMemo(() => {
     if (!selectedArtifact) {
       return [];
     }
-    const directIds = new Set(frontmatterRefs(selectedArtifact.frontmatter));
+    const directIds = new Set([...frontmatterRefs(selectedArtifact.frontmatter), ...bodyRefs(selectedArtifact.body)]);
     const reverseIds = new Set(
       Object.values(artifactDocsByPath)
-        .filter((doc) => doc.id !== selectedArtifact.id && frontmatterRefs(doc.frontmatter).includes(selectedArtifact.id))
+        .filter(
+          (doc) =>
+            doc.id !== selectedArtifact.id &&
+            (frontmatterRefs(doc.frontmatter).includes(selectedArtifact.id) || bodyRefs(doc.body).includes(selectedArtifact.id)),
+        )
         .map((doc) => doc.id),
     );
     const ids = new Set([...directIds, ...reverseIds]);
@@ -245,7 +398,9 @@ export function App() {
   }, [artifactDocsByPath, artifacts, selectedArtifact]);
 
   const latestReport = useMemo(() => {
-    return artifacts.find((artifact) => artifact.kind === "report") ?? artifacts.find((artifact) => artifact.path === "final_report.md");
+    return artifacts
+      .filter((artifact) => artifact.kind === "report")
+      .sort((a, b) => artifactTime(b) - artifactTime(a) || b.path.localeCompare(a.path))[0];
   }, [artifacts]);
 
   const refreshRuns = useCallback(async () => {
@@ -292,25 +447,41 @@ export function App() {
   }, [refreshRuns]);
 
   useEffect(() => {
+    api
+      .getMemory(effectiveDomain)
+      .then((payload) => setMemoryDocs(payload.memory))
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+  }, [effectiveDomain]);
+
+  useEffect(() => {
     if (!selectedRunId) {
+      setStreamState("idle");
       return;
     }
     eventSourceRef.current?.close();
+    setStreamState("connecting");
     setEvents([]);
     setSelectedArtifact(undefined);
 
     api
       .getEventHistory(selectedRunId)
-      .then((payload) => setEvents(payload.events))
+      .then((payload) => setEvents((current) => mergeEvents(current, payload.events)))
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
     refreshArtifacts(selectedRunId).catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
 
     const source = api.eventSource(selectedRunId);
     eventSourceRef.current = source;
+    source.onopen = () => {
+      setStreamState("live");
+      api
+        .getEventHistory(selectedRunId)
+        .then((payload) => setEvents((current) => mergeEvents(current, payload.events)))
+        .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+    };
     source.onmessage = (message) => {
       try {
         const event = JSON.parse(message.data) as ResearchEvent;
-        setEvents((current) => [...current, event].slice(-300));
+        setEvents((current) => mergeEvents(current, [event]));
       } catch {
         // Named SSE events are handled below.
       }
@@ -324,8 +495,11 @@ export function App() {
       "tool.started",
       "tool.finished",
       "artifact.created",
+      "artifact.updated",
       "claim.challenged",
       "insight.created",
+      "deep_dive.started",
+      "deep_dive.finished",
       "run.finished",
       "continuation.started",
       "continuation.finished",
@@ -334,9 +508,18 @@ export function App() {
     for (const name of eventNames) {
       source.addEventListener(name, (message) => {
         const event = JSON.parse((message as MessageEvent).data) as ResearchEvent;
-        setEvents((current) => [...current, event].slice(-300));
-        if (event.type === "artifact.created" || event.type === "run.finished") {
+        setEvents((current) => mergeEvents(current, [event]));
+        if (event.type === "artifact.created" || event.type === "artifact.updated" || event.type === "run.finished") {
           refreshArtifacts(selectedRunId).catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+        }
+        if (event.type === "artifact.updated" && selectedArtifactRef.current?.id === event.artifact.id) {
+          api
+            .readArtifactById(selectedRunId, event.artifact.id)
+            .then((payload) => {
+              setSelectedArtifact(payload.artifact);
+              setArtifactDocsByPath((current) => ({ ...current, [payload.artifact.path]: payload.artifact }));
+            })
+            .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
         }
         if (event.type === "run.updated" || event.type === "run.finished" || event.type === "run.failed") {
           refreshRuns().catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
@@ -344,9 +527,17 @@ export function App() {
       });
     }
     source.onerror = () => {
-      source.close();
+      if (source.readyState === EventSource.CLOSED) {
+        setStreamState("closed");
+        setError("Live event stream disconnected.");
+      } else {
+        setStreamState("reconnecting");
+      }
     };
-    return () => source.close();
+    return () => {
+      source.close();
+      setStreamState("closed");
+    };
   }, [refreshArtifacts, refreshRuns, selectedRunId]);
 
   useEffect(() => {
@@ -355,12 +546,23 @@ export function App() {
     }
   }, [activeTab, latestReport, openArtifact, selectedArtifact]);
 
+  useEffect(() => {
+    if (selectedArtifact) {
+      setFeedbackDimension(defaultFeedbackDimension(selectedArtifact.kind));
+      setFeedbackNote("");
+    }
+  }, [selectedArtifact]);
+
+  useEffect(() => {
+    selectedArtifactRef.current = selectedArtifact;
+  }, [selectedArtifact]);
+
   async function startRun(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(undefined);
     setIsStarting(true);
     try {
-      const payload = await api.createRun({ query, maxSearchTasks: 6 });
+      const payload = await api.createRun({ query, domain: domain.trim() || undefined, maxSearchTasks: 6 });
       setRuns((current) => [payload.run, ...current.filter((run) => run.id !== payload.run.id)]);
       setSelectedRunId(payload.run.id);
       setActiveTab("report");
@@ -375,12 +577,44 @@ export function App() {
     if (!selectedRunId || !selectedArtifact) {
       return;
     }
-    await api.addFeedback(selectedRunId, {
-      artifactId: selectedArtifact.id,
-      rating,
-      dimension: selectedArtifact.kind === "source" ? "credibility" : selectedArtifact.kind === "insight" ? "insight_value" : "usefulness",
-    });
-    await refreshArtifacts(selectedRunId);
+    setError(undefined);
+    setFeedbackInFlight(rating);
+    try {
+      await api.addFeedback(selectedRunId, {
+        artifactId: selectedArtifact.id,
+        rating,
+        dimension: feedbackDimension,
+        note: feedbackNote.trim() || undefined,
+      });
+      setFeedbackNote("");
+      await refreshArtifacts(selectedRunId);
+      const payload = await api.readArtifactById(selectedRunId, selectedArtifact.id);
+      setSelectedArtifact(payload.artifact);
+      setArtifactDocsByPath((current) => ({ ...current, [payload.artifact.path]: payload.artifact }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFeedbackInFlight(undefined);
+    }
+  }
+
+  async function cancelSelectedRun() {
+    if (!selectedRunId) {
+      return;
+    }
+    setError(undefined);
+    setIsCancelling(true);
+    try {
+      const payload = await api.cancelRun(selectedRunId);
+      if (!payload.cancelled) {
+        setError("Run is no longer active.");
+      }
+      await refreshRuns();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsCancelling(false);
+    }
   }
 
   async function continueFromArtifact() {
@@ -412,6 +646,9 @@ export function App() {
   const activeAgents = useMemo(() => {
     const active = new Map<string, ResearchEvent & { type: "agent.started" }>();
     for (const event of events) {
+      if (isTerminalRunEvent(event)) {
+        active.clear();
+      }
       if (event.type === "agent.started") {
         active.set(event.taskId, event);
       }
@@ -444,6 +681,18 @@ export function App() {
             <ShieldCheck size={15} />
             <span>{health?.fetchProvider || "fetch"}</span>
           </div>
+          <div className="status-tile">
+            <Brain size={15} />
+            <span>{formatLlmRuntime(health)}</span>
+          </div>
+          <div className="status-tile">
+            <Gauge size={15} />
+            <span>
+              {health
+                ? `${health.researchLimits.maxSearchAgents}/${health.researchLimits.maxReaderAgents}/${health.researchLimits.maxCritiqueAgents}`
+                : "limits"}
+            </span>
+          </div>
         </div>
 
         <div className="sidebar-section">
@@ -459,9 +708,27 @@ export function App() {
                 onClick={() => setSelectedRunId(run.id)}
               >
                 <span className="run-query">{run.query}</span>
+                {run.domain ? <span className="run-domain">{run.domain}</span> : null}
                 <span className={cn("run-status", run.status)}>{run.status}</span>
               </button>
             ))}
+          </div>
+        </div>
+
+        <div className="sidebar-section memory-section">
+          <div className="section-label">
+            <BookOpen size={14} />
+            Memory
+          </div>
+          <div className="memory-list">
+            {[...memoryDocs.domain, ...memoryDocs.global].slice(0, 5).map((doc) => (
+              <div className="memory-item" key={`${doc.kind}-${doc.path}`}>
+                <span>{doc.title}</span>
+                <small>{doc.path}</small>
+                <p>{compactBody(doc.body)}</p>
+              </div>
+            ))}
+            {memoryDocs.domain.length + memoryDocs.global.length === 0 ? <div className="empty-state">No memory loaded</div> : null}
           </div>
         </div>
       </aside>
@@ -470,7 +737,13 @@ export function App() {
         <form className="query-bar" onSubmit={startRun}>
           <div className="query-input-wrap">
             <Search size={17} />
-            <textarea value={query} onChange={(event) => setQuery(event.target.value)} rows={2} />
+            <div className="query-fields">
+              <textarea value={query} onChange={(event) => setQuery(event.target.value)} rows={2} />
+              <div className="domain-field">
+                <BookOpen size={14} />
+                <input value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="Domain memory" />
+              </div>
+            </div>
           </div>
           <button className="primary-button" disabled={isStarting || query.trim().length < 3}>
             {isStarting ? <RefreshCw size={16} className="spin" /> : <Sparkles size={16} />}
@@ -499,7 +772,7 @@ export function App() {
             <Brain size={16} />
             <div>
               <span>{activeAgents.length}</span>
-              <small>active agents</small>
+              <small>{runTelemetry.finishedAgentCount} finished</small>
             </div>
           </div>
           <div className="metric-card">
@@ -507,6 +780,17 @@ export function App() {
             <div>
               <span>{artifactCounts.claim}</span>
               <small>claims</small>
+            </div>
+          </div>
+          <div className="metric-card">
+            <Activity size={16} />
+            <div>
+              <span>{formatDuration(runTelemetry.runtimeMs) || "0ms"}</span>
+              <small>
+                {formatDuration(runTelemetry.averageAgentDurationMs) || "avg n/a"}
+                {runTelemetry.toolFailureCount > 0 ? `, ${runTelemetry.toolFailureCount} tool fail` : ""}
+                {runTelemetry.fallbackAgentCount > 0 ? `, ${runTelemetry.fallbackAgentCount} fallback` : ""}
+              </small>
             </div>
           </div>
         </section>
@@ -518,12 +802,18 @@ export function App() {
                 <h2>Research Room</h2>
                 <p>{selectedRun?.id ?? "No run selected"}</p>
               </div>
-              {selectedRun?.status === "running" ? (
-                <button className="ghost-button" onClick={() => selectedRunId && api.cancelRun(selectedRunId)}>
-                  <PauseCircle size={15} />
-                  Cancel
-                </button>
-              ) : null}
+              <div className="timeline-actions">
+                <span className={cn("stream-pill", `is-${streamState}`)} data-testid="stream-status">
+                  <Activity size={13} />
+                  {streamStatusLabel(streamState)}
+                </span>
+                {selectedRun?.status === "running" ? (
+                  <button className="ghost-button" onClick={cancelSelectedRun} disabled={isCancelling}>
+                    {isCancelling ? <RefreshCw size={15} className="spin" /> : <PauseCircle size={15} />}
+                    Cancel
+                  </button>
+                ) : null}
+              </div>
             </div>
 
             <div className="agent-strip">
@@ -597,15 +887,28 @@ export function App() {
                   onClick={continueFromArtifact}
                   disabled={isContinuing || selectedRun?.status === "running"}
                   title="Deepen this artifact"
+                  data-testid="deepen-artifact"
                 >
                   {isContinuing ? <RefreshCw size={15} className="spin" /> : <Sparkles size={15} />}
                   Deepen
                 </button>
-                <button className="icon-button" onClick={() => sendFeedback("up")} title="Upvote">
-                  <ThumbsUp size={15} />
+                <button
+                  className="icon-button"
+                  onClick={() => sendFeedback("up")}
+                  title="Upvote"
+                  disabled={Boolean(feedbackInFlight)}
+                  data-testid="feedback-up"
+                >
+                  {feedbackInFlight === "up" ? <RefreshCw size={15} className="spin" /> : <ThumbsUp size={15} />}
                 </button>
-                <button className="icon-button" onClick={() => sendFeedback("down")} title="Downvote">
-                  <ThumbsDown size={15} />
+                <button
+                  className="icon-button"
+                  onClick={() => sendFeedback("down")}
+                  title="Downvote"
+                  disabled={Boolean(feedbackInFlight)}
+                  data-testid="feedback-down"
+                >
+                  {feedbackInFlight === "down" ? <RefreshCw size={15} className="spin" /> : <ThumbsDown size={15} />}
                 </button>
               </div>
             ) : null}
@@ -613,6 +916,27 @@ export function App() {
 
           {selectedArtifact ? (
             <>
+              <div className="feedback-composer">
+                <select
+                  value={feedbackDimension}
+                  onChange={(event) => setFeedbackDimension(event.target.value as FeedbackRequest["dimension"])}
+                  title="Feedback dimension"
+                  data-testid="feedback-dimension"
+                >
+                  {(Object.keys(feedbackDimensionLabels) as FeedbackRequest["dimension"][]).map((dimension) => (
+                    <option key={dimension} value={dimension}>
+                      {feedbackDimensionLabels[dimension]}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  value={feedbackNote}
+                  onChange={(event) => setFeedbackNote(event.target.value)}
+                  placeholder="Feedback note"
+                  title="Feedback note"
+                  data-testid="feedback-note"
+                />
+              </div>
               <div className="frontmatter">
                 {Object.entries(selectedArtifact.frontmatter).slice(0, 8).map(([key, value]) => (
                   <div key={key}>
@@ -635,7 +959,7 @@ export function App() {
                   </div>
                 </div>
               ) : null}
-              <MarkdownView body={selectedArtifact.body} />
+              <MarkdownView body={selectedArtifact.body} artifactById={artifactById} onArtifactRefClick={openArtifact} />
             </>
           ) : (
             <div className="empty-detail">
